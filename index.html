@@ -1,0 +1,77 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>食用教程</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            text-align: center;
+            background-image: url('http://www.98qy.com/sjbz/api.php');
+            background-repeat: no-repeat;
+            background-size: cover;
+            background-position: center;
+            height: 100vh; /* Set body height to viewport height */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            position: relative; /* Add relative positioning for z-index */
+        }
+
+            /* Add a semi-transparent overlay for better text visibility */
+            body::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: rgba(0, 0, 0, 0.5); /* Adjust the opacity as needed */
+                z-index: -1;
+            }
+
+        h1 {
+            color: #fff;
+            padding: 20px;
+            margin: 0;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* Add text shadow for better visibility */
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #007bff;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px;
+        }
+
+            button:hover {
+                background-color: #0056b3;
+            }
+    </style>
+</head>
+
+<body>
+    <h1>食用教程</h1>
+    <button onclick="redirectToPage1()">前往京东</button>
+    <button onclick="redirectToPage2()">前往饿了么</button>
+
+    <script>
+        function redirectToPage1() {
+            window.location.href = "jd.html";
+        }
+
+        function redirectToPage2() {
+            window.location.href = "elm.html";
+        }
+    </script>
+</body>
+
+</html>
