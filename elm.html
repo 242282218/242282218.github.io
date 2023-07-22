@@ -1,0 +1,123 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>饿了么食用</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            text-align: left; /* 将文字对齐方式设置为左对齐 */
+            background-image: url('http://www.98qy.com/sjbz/api.php');
+            background-repeat: no-repeat;
+            background-size: cover;
+            background-position: center;
+            height: 100vh; /* 设置页面高度为视口高度 */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            position: relative; /* 添加相对定位以控制 z-index 层级 */
+        }
+
+            /* 添加半透明遮罩层以提高文字可读性 */
+            body::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: rgba(0, 0, 0, 0.6); /* 根据需要调整透明度 */
+                z-index: -1;
+            }
+
+        h1 {
+            color: #fff;
+            padding: 20px;
+            margin: 0;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* 添加文字阴影以提高可读性 */
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #007bff;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px;
+        }
+
+            button:hover {
+                background-color: #0056b3;
+            }
+
+        /* 额外样式以提高列表项的可读性 */
+        ul {
+            color: #fff; /* 将列表项文字颜色设为白色 */
+            list-style: none; /* 移除默认列表样式 */
+            padding-left: 0; /* 移除列表的默认左内边距 */
+            margin-bottom: 20px; /* 为列表与下一个元素添加一些间距 */
+        }
+
+        li::before {
+            content: '\2022'; /* 在每个列表项前添加符号（•） */
+            color: #fff; /* 将符号颜色设为白色 */
+            font-weight: bold; /* 使符号加粗 */
+            display: inline-block;
+            width: 1em; /* 设置符号的宽度以正确对齐列表项 */
+            margin-left: -1em; /* 将符号稍微向左移动以正确对齐 */
+        }
+
+        /* 设置步骤文字颜色为白色，并添加文字阴影以提高可读性 */
+        ol li {
+            color: #fff;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        /* 设置所有其他文字颜色为白色 */
+        p, h2, h3 {
+            color: #fff;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>饿了么食用</h1> <!-- 标题颜色改为白色 -->
+
+        <h2>第一节</h2> <!-- 副标题颜色改为白色 -->
+        <p>本节简介或概述。</p>
+        <ul>
+            <li>要点 1</li>
+            <li>要点 2</li>
+            <li>要点 3</li>
+        </ul>
+
+        <h3>小节 1.1</h3> <!-- 副副标题颜色改为白色 -->
+        <p>本小节的解释或步骤。</p>
+        <ol>
+            <li>步骤 1</li>
+            <li>步骤 2</li>
+            <li>步骤 3</li>
+        </ol>
+
+        <h3>小节 1.2</h3> <!-- 副副标题颜色改为白色 -->
+        <p>本小节的解释或步骤。</p>
+        <ol>
+            <li>步骤 1</li>
+            <li>步骤 2</li>
+            <li>步骤 3</li>
+        </ol>
+
+        <!-- 根据需要添加更多的节和小节 -->
+
+    </div>
+</body>
+
+</html>
