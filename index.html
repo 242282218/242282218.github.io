@@ -1,11 +1,15 @@
 ﻿<!DOCTYPE html>
-<html lang="en">
-
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>食用教程</title>
-    <style>
+  <meta charset="UTF-8">
+  <title>京东食用教程</title>
+
+  <style>
+    p {
+      cursor: pointer; /* 添加指针样式以指示可点击 */
+    }
+  </style>
+      <style>
         body {
             font-family: Arial, sans-serif;
             margin: 0;
@@ -44,6 +48,15 @@
             text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* Add text shadow for better visibility */
         }
 
+        p {
+            color: #fff;
+            font-size: 26px;
+            font-weight: bold;
+            padding: 20px;
+            margin: 0;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* Add text shadow for better visibility */
+        }
+
         button {
             padding: 12px 24px;
             font-size: 18px;
@@ -67,20 +80,40 @@
                 transform: scale(1.05);
             }
     </style>
-</head>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      var copyText = document.querySelector('p');
 
+      copyText.addEventListener('click', function() {
+        var text = copyText.textContent;
+
+        navigator.clipboard.writeText(text)
+          .then(function() {
+            console.log('文本已复制到剪贴板');
+          })
+          .catch(function(err) {
+            console.log('复制文本失败:', err);
+          });
+      });
+    });
+  </script>
+</head>
 <body>
     <h1>食用教程</h1>
+    <p>点击复制收藏本网址jd.999639.xyz</p>
     <button onclick="redirectToPage1()">前往京东</button>
+    <button onclick="redirectToPage2()">前往饿了么</button>
     
 
     <script>
         function redirectToPage1() {
             window.location.href = "jd.html";
-        }
-
-        
+        }   
+    </script>
+    <script>
+        function redirectToPage2() {
+            window.location.href = "elm.html";
+        }   
     </script>
 </body>
-
 </html>
