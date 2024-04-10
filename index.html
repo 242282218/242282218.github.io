@@ -9,77 +9,77 @@
       cursor: pointer; /* 添加指针样式以指示可点击 */
     }
   </style>
-      <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            text-align: center;
-            background-image: url('http://www.98qy.com/sjbz/api.php');
-            background-repeat: no-repeat;
-            background-size: cover;
-            background-position: center;
-            height: 100vh; /* Set body height to viewport height */
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            position: relative; /* Add relative positioning for z-index */
-        }
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      text-align: center;
+      background-image: url('http://www.98qy.com/sjbz/api.php');
+      background-repeat: no-repeat;
+      background-size: cover;
+      background-position: center;
+      height: 100vh; /* 设置 body 的高度为视口高度 */
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      position: relative; /* 添加相对定位以设置 z-index */
+    }
 
-            /* Add a semi-transparent overlay for better text visibility */
-            body::before {
-                content: "";
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                background-color: rgba(0, 0, 0, 0.5); /* Adjust the opacity as needed */
-                z-index: -1;
-            }
+    /* 添加半透明遮罩以提高文本可读性 */
+    body::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: rgba(0, 0, 0, 0.5); /* 根据需要调整透明度 */
+      z-index: -1;
+    }
 
-        h1 {
-            color: #fff;
-            font-size: 36px;
-            font-weight: bold;
-            padding: 20px;
-            margin: 0;
-            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* Add text shadow for better visibility */
-        }
+    h1 {
+      color: #fff;
+      font-size: 36px;
+      font-weight: bold;
+      padding: 20px;
+      margin: 0;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* 添加文本阴影以提高可读性 */
+    }
 
-        p {
-            color: #fff;
-            font-size: 26px;
-            font-weight: bold;
-            padding: 20px;
-            margin: 0;
-            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* Add text shadow for better visibility */
-        }
+    p {
+      color: #fff;
+      font-size: 26px;
+      font-weight: bold;
+      padding: 20px;
+      margin: 0;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* 添加文本阴影以提高可读性 */
+    }
 
-        button {
-            padding: 12px 24px;
-            font-size: 18px;
-            font-weight: bold;
-            background-color: #007bff;
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            margin: 10px;
-            box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3); /* Add box shadow for buttons */
-            transition: background-color 0.3s ease; /* Add smooth transition effect for background color change */
-        }
+    button {
+      padding: 12px 24px;
+      font-size: 18px;
+      font-weight: bold;
+      background-color: #007bff;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      margin: 10px;
+      box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3); /* 添加按钮的阴影效果 */
+      transition: background-color 0.3s ease; /* 添加平滑的背景颜色过渡效果 */
+    }
 
-            button:hover {
-                background-color: #0056b3;
-            }
+    button:hover {
+      background-color: #0056b3;
+    }
 
-            /* Add a subtle zoom-in effect on hover for buttons */
-            button:hover {
-                transform: scale(1.05);
-            }
-    </style>
+    /* 添加按钮的微小缩放效果 */
+    button:hover {
+      transform: scale(1.05);
+    }
+  </style>
   <script>
     document.addEventListener('DOMContentLoaded', function() {
       var copyText = document.querySelector('p');
