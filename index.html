@@ -1,78 +1,114 @@
 ﻿<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>食用教程</title>
 
-  <style>
-  /* 添加手机适配视口设置 */
+<style>
+/* 全局样式 */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
 
-  body {
-    font-family: sans-serif;
-    padding: 20px;
-    background-color: #333;
-    color: #fff;
-  }
+body {
+  font-family: Arial, sans-serif;
+  background-color: #f5f5f5;
+  color: #333;
+  overflow-x: hidden;
+}
 
-  h1 {
-    font-size: 2em;
-    text-align: center;
-  }
+.container {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+}
 
-  p {
-    font-size: 1.2em;
-    line-height: 1.5;
-    cursor: pointer; /* 添加光标样式 */
-    user-select: all; /* 允许文本被选中 */
-  }
+/* 遮罩效果 */
+body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: -1;
+}
 
-  button {
-    display: block;
-    width: 100%;
-    padding: 10px;
-    margin: 10px auto;
-    font-size: 1em;
-    border: none;
-    border-radius: 4px;
-    color: #fff;
-    background-color: #007bff;
-  }
+/* 标题样式 */
+h1 {
+  color: #fff;
+  font-size: 24px;
+  font-weight: bold;
+  padding: 20px;
+  text-align: center;
+  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
 
-  button:hover {
-    opacity: 0.8;
-  }
-  </style>
+/* 段落样式 */
+p {
+  font-size: 18px;
+  padding: 20px;
+  margin-bottom: 20px;
+  background-color: #007bff;
+  color: #fff;
+  text-align: center;
+  cursor: pointer;
+}
 
-  <!-- DOM 操作 -->
-  <script>
-  document.addEventListener('DOMContentLoaded', function() {
-    var copyText = document.getElementById('copy-text');
+/* 按钮样式 */
+button {
+  display: block;
+  width: 100%;
+  padding: 12px 0;
+  font-size: 18px;
+  font-weight: bold;
+  background-color: #007bff;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 10px;
+  transition: background-color 0.3s, transform 0.3s;
+}
 
-    copyText.addEventListener('click', function() {
-      // 创建一个临时的textarea元素
-      var textarea = document.createElement('textarea');
-      textarea.value = copyText.textContent;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
+button:hover {
+  background-color: #0056b3;
+  transform: scale(1.05);
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>食用教程</h1>
+  <p id="copyText">点击复制收藏本网址 jd.999639.xyz</p>
+  <button onclick="redirectToPage('jd.html')">前往京东</button>
+  <button onclick="redirectToPage('elm.html')">前往饿了么</button>
+</div>
 
-      // 更改文本样式
-      copyText.style.backgroundColor = '#007bff';
-      copyText.textContent = '已复制！';
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var copyText = document.getElementById('copyText');
+
+  copyText.addEventListener('click', function() {
+    var text = copyText.textContent.trim().split(' ')[1]; // 获取空格后的内容
+
+    navigator.clipboard.writeText(text)
+    .then(function() {
+      console.log('文本已复制到剪贴板');
+    })
+    .catch(function(err) {
+      console.log('复制文本失败:', err);
     });
   });
-  </script>
+});
 
-</head>
-
-<body>
-
-  <h1>食用教程</h1>
-
-  <p id="copy-text">收藏本网址 jd.999639.xyz 长期有效，点击复制</p>
-
-  <button>前往京东</button>
-  <button>前往饿了么</button>
-  
+function redirectToPage(url) {
+  window.location.href = url;
+}
+</script>
 </body>
 </html>
