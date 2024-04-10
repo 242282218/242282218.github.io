@@ -1,119 +1,78 @@
 ﻿<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <title>京东食用教程</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <style>
-    p {
-      cursor: pointer; /* 添加指针样式以指示可点击 */
-    }
+  /* 添加手机适配视口设置 */
+
+  body {
+    font-family: sans-serif;
+    padding: 20px;
+    background-color: #333;
+    color: #fff;
+  }
+
+  h1 {
+    font-size: 2em;
+    text-align: center;
+  }
+
+  p {
+    font-size: 1.2em;
+    line-height: 1.5;
+    cursor: pointer; /* 添加光标样式 */
+    user-select: all; /* 允许文本被选中 */
+  }
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    margin: 10px auto;
+    font-size: 1em;
+    border: none;
+    border-radius: 4px;
+    color: #fff;
+    background-color: #007bff;
+  }
+
+  button:hover {
+    opacity: 0.8;
+  }
   </style>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 0;
-      padding: 0;
-      text-align: center;
-      background-image: url('http://www.98qy.com/sjbz/api.php');
-      background-repeat: no-repeat;
-      background-size: cover;
-      background-position: center;
-      height: 100vh; /* 设置 body 的高度为视口高度 */
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      position: relative; /* 添加相对定位以设置 z-index */
-    }
 
-    /* 添加半透明遮罩以提高文本可读性 */
-    body::before {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background-color: rgba(0, 0, 0, 0.5); /* 根据需要调整透明度 */
-      z-index: -1;
-    }
-
-    h1 {
-      color: #fff;
-      font-size: 36px;
-      font-weight: bold;
-      padding: 20px;
-      margin: 0;
-      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* 添加文本阴影以提高可读性 */
-    }
-
-    p {
-      color: #fff;
-      font-size: 26px;
-      font-weight: bold;
-      padding: 20px;
-      margin: 0;
-      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5); /* 添加文本阴影以提高可读性 */
-    }
-
-    button {
-      padding: 12px 24px;
-      font-size: 18px;
-      font-weight: bold;
-      background-color: #007bff;
-      color: #fff;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      margin: 10px;
-      box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3); /* 添加按钮的阴影效果 */
-      transition: background-color 0.3s ease; /* 添加平滑的背景颜色过渡效果 */
-    }
-
-    button:hover {
-      background-color: #0056b3;
-    }
-
-    /* 添加按钮的微小缩放效果 */
-    button:hover {
-      transform: scale(1.05);
-    }
-  </style>
+  <!-- DOM 操作 -->
   <script>
-    document.addEventListener('DOMContentLoaded', function() {
-      var copyText = document.querySelector('p');
+  document.addEventListener('DOMContentLoaded', function() {
+    var copyText = document.getElementById('copy-text');
 
-      copyText.addEventListener('click', function() {
-        var text = copyText.textContent;
+    copyText.addEventListener('click', function() {
+      // 创建一个临时的textarea元素
+      var textarea = document.createElement('textarea');
+      textarea.value = copyText.textContent;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
 
-        navigator.clipboard.writeText(text)
-          .then(function() {
-            console.log('文本已复制到剪贴板');
-          })
-          .catch(function(err) {
-            console.log('复制文本失败:', err);
-          });
-      });
+      // 更改文本样式
+      copyText.style.backgroundColor = '#007bff';
+      copyText.textContent = '已复制！';
     });
+  });
   </script>
-</head>
-<body>
-    <h1>食用教程</h1>
-    <p>点击复制收藏本网址jd.999639.xyz</p>
-    <button onclick="redirectToPage1()">前往京东</button>
-    <button onclick="redirectToPage2()">前往饿了么</button>
-    
 
-    <script>
-        function redirectToPage1() {
-            window.location.href = "jd.html";
-        }   
-    </script>
-    <script>
-        function redirectToPage2() {
-            window.location.href = "elm.html";
-        }   
-    </script>
+</head>
+
+<body>
+
+  <h1>食用教程</h1>
+
+  <p id="copy-text">收藏本网址 jd.999639.xyz 长期有效，点击复制</p>
+
+  <button>前往京东</button>
+  <button>前往饿了么</button>
+  
 </body>
 </html>
