@@ -21,7 +21,7 @@ export const GET: APIRoute = async ({ site }) => {
 
   const feed = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
-<title>242282218 的技术手记</title>
+<title>guanlangzg 的技术手记</title>
 <link>${site.href}</link>
 <description>项目实践、技术文章与学习笔记。</description>
 <language>zh-CN</language>

@@ -22,14 +22,14 @@ const currentPath = Astro.url.pathname;
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical.href} />
     <link rel="canonical" href={canonical.href} />
-    <link rel="alternate" type="application/rss+xml" title="242282218 的文章" href="/rss.xml" />
+    <link rel="alternate" type="application/rss+xml" title="guanlangzg 的文章" href="/rss.xml" />
     <title>{title}</title>
   </head>
   <body>
     <a class="skip-link" href="#main">跳至正文</a>
     <header class="site-header">
       <div class="shell header-inner">
-        <a class="brand" href="/">242282218 / 技术手记</a>
+        <a class="brand" href="/">guanlangzg / 技术手记</a>
         <nav class="site-nav" aria-label="主导航">
           <a href="/" aria-current={currentPath === '/' ? 'page' : undefined}>首页</a>
           <a href="/projects/" aria-current={currentPath === '/projects/' ? 'page' : undefined}>项目</a>
@@ -41,8 +41,8 @@ const currentPath = Astro.url.pathname;
     <main id="main"><slot /></main>
     <footer class="site-footer">
       <div class="shell footer-inner">
-        <span>© {new Date().getFullYear()} 242282218 · 记录实践，持续学习。</span>
-        <a href="https://github.com/242282218" rel="me">GitHub ↗</a>
+        <span>© {new Date().getFullYear()} guanlangzg · 记录实践，持续学习。</span>
+        <a href="https://github.com/guanlangzg" rel="me">GitHub ↗</a>
       </div>
     </footer>
   </body>
