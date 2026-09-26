@@ -13,7 +13,7 @@ const formatDate = (date: Date) => new Intl.DateTimeFormat('zh-CN', {
 }).format(date);
 ---
 {visiblePosts.length === 0 ? (
-  <p class="empty-state">还没有公开文章。写下第一篇后，它会出现在这里。</p>
+  <p class="empty-state">还没有公开的记录。写下第一篇后，它会出现在这里。</p>
 ) : (
   <div>
     {visiblePosts.map((post) => (

@@ -6,9 +6,9 @@ import { publishedPosts } from '../../lib/posts';
 
 const posts = publishedPosts(await getCollection('blog'));
 ---
-<BaseLayout title="文章 · 观澜志" description="观澜的技术文章与学习笔记。">
+<BaseLayout title="学习记录 · 观澜志" description="观澜整理的学习记录。">
   <div class="shell">
-    <header class="page-intro"><p class="eyebrow">技术文章 · 学习笔记</p><h1>写下过程，也留下答案。</h1><p>这里会记录项目实践、技术问题和学习中的思考。文章将持续更新。</p></header>
+    <header class="page-intro"><p class="eyebrow">学习记录</p><h1>写下学习的过程。</h1><p>遇到的问题、做过的尝试，以及当时的想法，都放在这里。</p></header>
     <div class="list-page"><PostList posts={posts} /></div>
   </div>
 </BaseLayout>
