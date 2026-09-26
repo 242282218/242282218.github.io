@@ -1,0 +1,49 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const currentPath = Astro.url.pathname;
+---
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f8fafb" />
+    <meta name="description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical.href} />
+    <link rel="canonical" href={canonical.href} />
+    <link rel="alternate" type="application/rss+xml" title="242282218 的文章" href="/rss.xml" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳至正文</a>
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="/">242282218 / 技术手记</a>
+        <nav class="site-nav" aria-label="主导航">
+          <a href="/" aria-current={currentPath === '/' ? 'page' : undefined}>首页</a>
+          <a href="/projects/" aria-current={currentPath === '/projects/' ? 'page' : undefined}>项目</a>
+          <a href="/blog/" aria-current={currentPath.startsWith('/blog/') ? 'page' : undefined}>文章</a>
+          <a href="/about/" aria-current={currentPath === '/about/' ? 'page' : undefined}>关于</a>
+        </nav>
+      </div>
+    </header>
+    <main id="main"><slot /></main>
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <span>© {new Date().getFullYear()} 242282218 · 记录实践，持续学习。</span>
+        <a href="https://github.com/242282218" rel="me">GitHub ↗</a>
+      </div>
+    </footer>
+  </body>
+</html>
