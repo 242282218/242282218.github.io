@@ -13,7 +13,7 @@ const { post } = Astro.props as { post: CollectionEntry<'blog'> };
 const { Content } = await render(post);
 const date = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' }).format(post.data.pubDate);
 ---
-<BaseLayout title={`${post.data.title} · guanlangzg`} description={post.data.description}>
+<BaseLayout title={`${post.data.title} · 观澜志`} description={post.data.description}>
   <div class="shell">
     <article class="article">
       <header class="article-header">
