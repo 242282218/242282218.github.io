@@ -23,7 +23,7 @@ export const GET: APIRoute = async ({ site }) => {
 <rss version="2.0"><channel>
 <title>观澜志</title>
 <link>${site.href}</link>
-<description>项目实践、技术文章与学习笔记。</description>
+<description>观澜的学习记录，整理问题、尝试和想法。</description>
 <language>zh-CN</language>
 ${items}
 </channel></rss>`;
