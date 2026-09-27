@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vditor 往返验收夹具</title>
+    <style>
+      body {
+        font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+        margin: 0;
+        padding: 16px;
+        background: #fbfbfd;
+        color: #131a26;
+      }
+      .editor-host {
+        height: 220px;
+        border: 1px solid #dde2ea;
+        border-radius: 6px;
+        margin-bottom: 12px;
+        background: #fff;
+      }
+      #result {
+        white-space: pre-wrap;
+        font-family: 'Cascadia Mono', Consolas, monospace;
+        font-size: 12px;
+        background: #fff;
+        border: 1px solid #dde2ea;
+        border-radius: 6px;
+        padding: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 style="font-size: 16px">Vditor 往返验收（真实 Chromium）</h1>
+    <p id="progress" style="font-size: 13px">正在运行…</p>
+    <div id="hosts"></div>
+    <pre id="result" data-status="running">{}</pre>
+
+    <script type="module">
+      import Vditor from 'vditor'
+      import 'vditor/dist/index.css'
+      // 直接复用应用里的判定实现，保证夹具与产品逻辑只有一份规则。
+      import { evaluateRoundTrip } from '/src/components/MarkdownEditor.ts'
+
+      const FIXTURES = {
+        中文段落:
+          '读到一段陌生代码时，第一遍没有看懂很正常。比起从第一行逐字读到最后一行，可以先找它的边界：谁调用它？它接收什么？\n\n先用自己的话复述：**从全部条目中取出可公开的内容**，并按日期从新到旧排列。\n\n这里有「中文引号」、全角（括号）与省略号……还有 emoji 🎯。\n',
+        代码围栏:
+          '下面是一段测试样稿：\n\n```ts\nexport function pick<T>(items: readonly T[]): T[] {\n  return [...items].filter(Boolean)\n}\n```\n\n行内代码 `pnpm build` 与 HTML `<div class="a">中文</div>` 都应保持原样。\n',
+        GFM表格:
+          '| 步骤 | 说明 |\n| --- | --- |\n| 一 | 找输入与输出 |\n| 二 | 试一个最小输入 |\n\n表格之后仍有一段中文正文。\n',
+        链接与转义:
+          '参考 [Astro 文档](https://docs.astro.build/en/guides/content-collections/) 与 [相对链接](../notes/first)。\n\n带下划线的链接 \\_underscore\\_ 不应被当作强调。\n',
+        图片相对链接:
+          '![示意图](/blog/read-code/figure-01.png)\n\n![相对路径](./figure-02.png)\n\n![外链](https://example.invalid/pic.png)\n',
+        列表与引用:
+          '> 记录的目的不是证明自己已经全部掌握，而是给下一次阅读留一个明确起点。\n\n- 第一条记录\n- 第二条记录\n  - 嵌套条目\n\n1. 有序第一项\n2. 有序第二项\n',
+        长文混合: [
+          '# 小标题（正文中不应出现，仅作夹具）',
+          '',
+          '中文段落里带 **加粗**、*斜体* 与 `行内代码`。',
+          '',
+          '```python',
+          'def pick(items):',
+          '    return [i for i in items if i.public]',
+          '```',
+          '',
+          '| 名称 | 值 |',
+          '| --- | --- |',
+          '| a | 1 |',
+          '',
+          '> 引用一段中文。',
+          '',
+          '![图](/blog/mixed/figure.png)',
+          '',
+        ].join('\n'),
+      }
+
+      /** 在指定模式下用真实 Vditor 做一次往返。 */
+      function roundTrip(markdown, mode) {
+        return new Promise((resolve) => {
+          const host = document.createElement('div')
+          host.className = 'editor-host'
+          document.getElementById('hosts').appendChild(host)
+
+          let settled = false
+          const finish = (value) => {
+            if (settled) return
+            settled = true
+            try {
+              editor.destroy()
+            } catch {
+              /* 忽略清理错误 */
+            }
+            host.remove()
+            resolve(value)
+          }
+
+          const editor = new Vditor(host, {
+            mode,
+            value: markdown,
+            cache: { enable: false },
+            height: 200,
+            toolbar: [],
+            input: () => undefined,
+            after: () => {
+              window.setTimeout(() => {
+                let value = ''
+                try {
+                  value = editor.getValue()
+                } catch (error) {
+                  finish({ error: String(error), value: '' })
+                  return
+                }
+                finish({ error: null, value })
+              }, 150)
+            },
+          })
+        })
+      }
+
+      /** 单次往返的判定结果。 */
+      function judge(from, to, source, result) {
+        if (result.error) {
+          return { blocked: true, normalized: false, reason: 'error: ' + result.error, error: result.error }
+        }
+        const report = evaluateRoundTrip(from, to, source, result.value)
+        return {
+          blocked: report.blocked,
+          normalized: report.normalized,
+          normalizationKind: report.normalizationKind ?? null,
+          reason: report.reason,
+          error: null,
+        }
+      }
+
+      async function run() {
+        const results = {}
+        const names = Object.keys(FIXTURES)
+        for (let i = 0; i < names.length; i += 1) {
+          const name = names[i]
+          document.getElementById('progress').textContent = `正在运行：${name}（${i + 1}/${names.length}）`
+          const source = FIXTURES[name]
+          const entry = {}
+
+          entry.sv = judge('sv', 'sv', source, await roundTrip(source, 'sv'))
+          entry.ir = judge('ir', 'ir', source, await roundTrip(source, 'ir'))
+
+          // 关键路径：源码模式保存后切到即时渲染再取回。
+          const sv = await roundTrip(source, 'sv')
+          const ir = await roundTrip(sv.value, 'ir')
+          entry.svToIr = judge('sv', 'ir', source, ir)
+          entry.afterSvToIr = ir.value
+          results[name] = entry
+        }
+
+        document.getElementById('progress').textContent = '已完成'
+        const el = document.getElementById('result')
+        el.dataset.status = 'done'
+        el.textContent = JSON.stringify(results, null, 2)
+      }
+
+      run().catch((error) => {
+        document.getElementById('progress').textContent = '运行失败'
+        const el = document.getElementById('result')
+        el.dataset.status = 'error'
+        el.textContent = JSON.stringify({ fatal: String(error) }, null, 2)
+      })
+    </script>
+  </body>
+</html>
