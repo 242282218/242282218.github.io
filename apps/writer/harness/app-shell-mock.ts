@@ -8,8 +8,8 @@
  */
 import { createApp } from 'vue'
 import App from '@/App.vue'
+import '@/styles/theme.css'
 import '@/styles/tokens.css'
-import 'vditor/dist/index.css'
 import type {
   ArticleContent,
   ArticleSummary,
@@ -52,9 +52,22 @@ const articles: ArticleSummary[] = [
       remoteSync: 'saved',
       site: 'live-old-version',
       localBodyHash: 'a'.repeat(64),
-      writingBodyHash: 'a'.repeat(64),
-      mainBodyHash: 'b'.repeat(64),
-      mainCommit: 'c'.repeat(40),
+      writing: {
+        state: 'present',
+        head: 'c'.repeat(40),
+        checkedAtUnix: 1789000000,
+        bodyHash: 'a'.repeat(64),
+        siteHash: 'a'.repeat(64),
+      },
+      main: {
+        state: 'present',
+        head: 'c'.repeat(40),
+        checkedAtUnix: 1789000000,
+        bodyHash: 'b'.repeat(64),
+        siteHash: 'b'.repeat(64),
+        published: true,
+      },
+      remoteCheckedAtUnix: 1789000000,
     },
   },
   {
@@ -72,6 +85,28 @@ const articles: ArticleSummary[] = [
       remoteSync: 'local-only',
       site: 'never-published',
       localBodyHash: 'd'.repeat(64),
+      writing: { state: 'absent', checkedAtUnix: 1788000000 },
+      main: { state: 'absent', checkedAtUnix: 1788000000 },
+      remoteCheckedAtUnix: 1788000000,
+    },
+  },
+  {
+    id: 'mock-unverified',
+    title: '测试样稿：远端待核对',
+    description: '展示核对失败时的未知态：既不说已同步，也不说从未发布。',
+    tags: ['测试样稿'],
+    pubDate: '2026-09-19',
+    draft: true,
+    imageCount: 0,
+    source: 'workspace',
+    lastEditedUnix: 1787500000,
+    status: {
+      locallySaved: true,
+      remoteSync: 'unverified',
+      site: 'unverified',
+      localBodyHash: '9'.repeat(64),
+      writing: { state: 'unverified', reason: '写作分支状态待核对：网络不可用或核对超时' },
+      main: { state: 'unverified', reason: '网站分支状态待核对：网络不可用或核对超时' },
     },
   },
   {
@@ -89,8 +124,22 @@ const articles: ArticleSummary[] = [
       remoteSync: 'conflict',
       site: 'deploy-failed',
       localBodyHash: 'e'.repeat(64),
-      writingBodyHash: 'f'.repeat(64),
-      mainCommit: '1'.repeat(40),
+      writing: {
+        state: 'present',
+        head: '1'.repeat(40),
+        checkedAtUnix: 1787000000,
+        bodyHash: 'f'.repeat(64),
+        siteHash: 'f'.repeat(64),
+      },
+      main: {
+        state: 'present',
+        head: '1'.repeat(40),
+        checkedAtUnix: 1787000000,
+        bodyHash: 'b'.repeat(64),
+        siteHash: 'b'.repeat(64),
+        published: true,
+      },
+      remoteCheckedAtUnix: 1787000000,
     },
   },
   {
@@ -107,6 +156,9 @@ const articles: ArticleSummary[] = [
       remoteSync: 'local-only',
       site: 'never-published',
       localBodyHash: '2'.repeat(64),
+      writing: { state: 'absent', checkedAtUnix: 1787000000 },
+      main: { state: 'absent', checkedAtUnix: 1787000000 },
+      remoteCheckedAtUnix: 1787000000,
     },
     loadError: {
       code: 'front-matter-missing',
@@ -123,12 +175,16 @@ const connection: ConnectionStatus = {
   connected: true,
   workspaceReady: true,
   toolchain: {
-    git: { available: true, version: 'git version 2.52.0.windows.1' },
-    node: { available: true, version: 'v24.12.0' },
-    pnpm: { available: true, version: '10.28.2' },
-    nodeMeetsMinimum: true,
-    missing: [],
-    guidance: [],
+    kind: 'checked',
+    atUnix: 1789000000,
+    report: {
+      git: { available: true, version: 'git version 2.52.0.windows.1' },
+      node: { available: true, version: 'v24.12.0' },
+      pnpm: { available: true, version: '10.28.2' },
+      nodeMeetsMinimum: true,
+      missing: [],
+      guidance: [],
+    },
   },
   publicDisclosure:
     '本软件使用公开仓库保存远程草稿：在写作分支中同步的草稿对任何访问者可见，网站上不会展示未发布的文章。',
@@ -227,13 +283,28 @@ const deployment: DeploymentStatus = {
 }
 
 /** 命令处理器表：键为命令名，值为根据参数返回数据的函数。 */
-const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
-  connection_status: () => connection,
+const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {  connection_status: () => connection,
   acknowledge_disclosure: () => connection,
   connect: () => connection,
   toolchain_report: () => connection.toolchain,
   list_articles: () => articles,
   read_article: (args: Record<string, unknown>) => contentFor(String(args.articleId)),
+  /**
+   * 远端核对：夹具直接返回该文章当前状态的**已核对**版本。
+   *
+   * 这不模拟网络延迟——夹具的用途是看界面呈现，不是测时序；迟到结果与
+   * 丢弃逻辑由 `remote-state.test.ts` 用可控 Promise 覆盖。
+   */
+  check_article_remote: (args: Record<string, unknown>) => {
+    const id = String(args.articleId)
+    const found = articles.find((item) => item.id === id) ?? articles[0]!
+    lastRemoteCheckId = id
+    return {
+      articleId: id,
+      localBodyHash: found.status.localBodyHash,
+      status: found.status,
+    }
+  },
   create_article: (args: Record<string, unknown>) => ({
     ...contentFor(String(args.articleId)),
     meta: args.meta,
@@ -244,6 +315,15 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     body: String(args.body),
   }),
   import_article: (args: Record<string, unknown>) => contentFor(String(args.articleId)),
+  /**
+   * 导出：夹具不写盘，只记录一次调用供断言。
+   *
+   * 与 `import_article_image` 同理，「另存为」对话框本身在浏览器夹具里不可用
+   * （没有 `plugin:dialog|save`），因此界面夹具覆盖的是 IPC 之后的链路。
+   */
+  export_article: (args: Record<string, unknown>) => {
+    lastExportCall = { articleId: String(args.articleId), targetPath: String(args.targetPath) }
+  },
   import_article_image: (args: Record<string, unknown>) => ({
     articleId: args.articleId,
     relPath: `public/blog/${args.articleId}/figure-mock-0000.png`,
@@ -352,6 +432,9 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     simulatePublic: true,
   }),
   stop_site_preview: () => null,
+  // 依赖已就绪：夹具不模拟安装过程，也不声称有后台任务。
+  preview_dependency_status: () => ({ kind: 'ready', checkedAtUnix: 1789000000 }),
+  prepare_preview_dependencies: () => ({ kind: 'ready', checkedAtUnix: 1789000000 }),
   status_overview: () => articles.map((item) => item.status),
 }
 
@@ -361,6 +444,17 @@ let lastRawInvoke: { byteLength: number; articleId: string; fileName: string } |
 
 /** 最近一次崩溃恢复操作（恢复/丢弃），供测试断言。 */
 let lastRecoveryCall: { action: 'restore' | 'discard'; articleId: string } | null = null
+
+/**
+ * 最近一次远端核对的文章 ID。
+ *
+ * 用于在真实浏览器里确认「打开文章会触发一次核对，而保存不会」——
+ * 这是阶段一 A5 的核心行为，必须在界面上可观测。
+ */
+let lastRemoteCheckId: string | null = null
+
+/** 最近一次导出调用（文章 ID 与目标路径），供界面夹具断言。 */
+let lastExportCall: { articleId: string; targetPath: string } | null = null
 
 ;(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
   invoke: async (
@@ -394,6 +488,8 @@ let lastRecoveryCall: { action: 'restore' | 'discard'; articleId: string } | nul
 ;(window as unknown as Record<string, unknown>).__mockState = {
   lastRawInvoke: () => lastRawInvoke,
   lastRecoveryCall: () => lastRecoveryCall,
+  lastRemoteCheckId: () => lastRemoteCheckId,
+  lastExportCall: () => lastExportCall,
 }
 
 createApp(App).mount('#app')

@@ -110,6 +110,38 @@ describe('sanitizeWithReport', () => {
   })
 })
 
+describe('预览必须保持离线：图片不得指向远端', () => {
+  it('移除远端图片，只保留站内相对路径（与 CSP 的 img-src 一致）', () => {
+    const result = sanitizeHtml('<img src="https://cdn.example.invalid/a.png" alt="远端">')
+    expect(result).not.toContain('cdn.example.invalid')
+    // 站内路径照常保留。
+    expect(sanitizeHtml('<img src="/blog/a/f.png" alt="本地">')).toContain('/blog/a/f.png')
+  })
+
+  it('保留本机预览服务与内联数据图片', () => {
+    expect(sanitizeHtml('<img src="http://127.0.0.1:4321/blog/a/f.png">')).toContain('127.0.0.1')
+    expect(sanitizeHtml('<img src="data:image/png;base64,iVBORw0KGgo=">')).toContain('data:image/png')
+  })
+
+  it('拒绝用 userinfo 伪装的「本机」地址', () => {
+    const result = sanitizeHtml('<img src="http://127.0.0.1@evil.invalid/a.png">')
+    expect(result).not.toContain('evil.invalid')
+  })
+
+  it('srcset 的每个候选都要校验，不能凭首候选放行', () => {
+    // 首候选安全、后续候选是远端：整条属性必须丢弃。
+    const mixed = sanitizeHtml(
+      '<img src="/blog/a/f.png" srcset="/blog/a/f.png 1x, https://evil.invalid/big.png 2x">',
+    )
+    expect(mixed).not.toContain('evil.invalid')
+    expect(mixed).not.toContain('srcset')
+
+    // 全部候选安全时保留。
+    const safe = sanitizeHtml('<img src="/blog/a/f.png" srcset="/blog/a/f.png 1x, /blog/a/f2.png 2x">')
+    expect(safe).toContain('srcset')
+  })
+})
+
 describe('escapeHtml 兜底', () => {
   it('转义全部危险字符', () => {
     const result = escapeHtml('<p>"a" & \'b\'</p>')

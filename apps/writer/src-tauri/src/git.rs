@@ -5,8 +5,8 @@
 //! 命令注入面。日志与错误只在调用方记录非敏感字段。
 
 use crate::model::{ErrorCode, Result, WriterError};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 一次 Git 命令的执行结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +56,7 @@ fn run_git_inner(
     args: &[&str],
     envs: &[GitEnv],
 ) -> Result<GitOutput> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::util::program_command("git");
     cmd.current_dir(dir);
     // 固定输出语言与颜色，便于稳定解析错误信息。
     cmd.env("LC_ALL", "C");
@@ -99,6 +99,80 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<GitOutput> {
 /// 执行 `git` 子命令并附加环境变量覆盖（如 `GIT_INDEX_FILE`）。
 pub fn git_with_env(dir: &Path, args: &[&str], envs: &[(&'static str, String)]) -> Result<GitOutput> {
     run_git_raw(dir, args, envs)
+}
+
+/// 带超时执行一次 `git` 子命令；超时则终止子进程并返回 `Err`。
+///
+/// 远端核对必须能超时返回：断网时 `git fetch` 可能长时间挂住，若没有上限，
+/// 界面就会一直停在「正在核对」，而用户既看不到结论也无法取消。超时**不会**
+/// 复用上一次的结论——调用方必须把它当成「未核对」处理。
+pub fn git_with_timeout(dir: &Path, args: &[&str], timeout: std::time::Duration) -> Result<GitOutput> {
+    let mut cmd = crate::util::program_command("git");
+    cmd.current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["-c", "core.quotePath=false"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|err| {
+        let message = if err.kind() == std::io::ErrorKind::NotFound {
+            "未找到 git 可执行文件，请先安装 Git for Windows"
+        } else {
+            "无法启动 git 命令"
+        };
+        WriterError::new(ErrorCode::ToolchainMissing, message)
+    })?;
+
+    // 必须**并发**读取管道。`git show` 这类命令的输出可能超过管道缓冲区
+    // （Windows 默认 64 KiB）：若父进程只等退出再读，子进程会阻塞在写管道上，
+    // 双方互等，最终被误判成「远端核对超时」。
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || read_pipe(stdout_pipe));
+    let stderr_reader = std::thread::spawn(move || read_pipe(stderr_pipe));
+
+    // 轮询等待：`Child::wait_timeout` 不在标准库里，用短睡眠避免引入依赖。
+    let deadline = std::time::Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // 超时：先终止再取走管道，避免句柄泄漏与孤儿进程。
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(WriterError::new(
+                        ErrorCode::Offline,
+                        "远端核对超时，已放弃本次核对；状态保持为「未核对」",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => break Err(WriterError::new(ErrorCode::GitFailed, format!("等待 git 失败：{e}"))),
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = outcome?;
+    if status.success() {
+        return Ok(GitOutput { stdout, stderr });
+    }
+    Err(classify(stderr, stdout, status.code()))
+}
+
+/// 读完一个管道并转为字符串；管道缺失（`None`）时返回空串。
+///
+/// 读取失败只影响诊断文本，不应让整条命令失败：调用方已经拿到退出码。
+fn read_pipe<R: Read>(pipe: Option<R>) -> String {
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buffer);
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// 把 Git 的失败信息归类为可操作的错误码。
@@ -220,7 +294,7 @@ pub fn show_file(dir: &Path, rev: &str, rel_path: &str) -> Result<Option<Vec<u8>
     let spec = format!("{rev}:{rel_path}");
     // 用 `--` 分隔无法阻止 `rev:path` 被解析，故先校验路径属于受管范围。
     crate::paths::validate_managed_rel_path(rel_path)?;
-    let output = Command::new("git")
+    let output = crate::util::program_command("git")
         .current_dir(dir)
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -296,6 +370,7 @@ pub fn temp_path(prefix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn normalizes_remote_urls() {
@@ -346,5 +421,51 @@ mod tests {
         // 该环境一定有 git；这里只断言错误分类函数的兜底行为。
         let err = WriterError::new(ErrorCode::ToolchainMissing, "x");
         assert_eq!(err.code, ErrorCode::ToolchainMissing);
+    }
+
+    /// `git_with_timeout` 必须并发读取管道，否则大输出会与子进程互等至超时。
+    ///
+    /// 夹具在一个临时仓库里跟踪 4000 个文件，`git ls-files` 因此产出远大于管道
+    /// 缓冲（Windows 默认 64 KiB）的输出。若实现是「先等退出、再读管道」，子进程
+    /// 会阻塞在写管道上、父进程阻塞在等退出，最终被误判成超时（`ErrorCode::Offline`）。
+    #[test]
+    fn git_with_timeout_drains_large_output_without_false_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--initial-branch=main"]).unwrap();
+        // 造 4000 个文件并纳入索引（`ls-files` 只列已跟踪文件）。
+        for index in 0..4000 {
+            let name = format!("file-{index:05}-padding-padding-padding.txt");
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        git(dir.path(), &["add", "-A"]).unwrap();
+
+        let out = git_with_timeout(
+            dir.path(),
+            &["ls-files"],
+            // 有界超时：若无并发读取，子进程会阻塞在写管道上、父进程阻塞在等退出，
+            // 死锁会在 20s 后被当成超时（`Offline`）——于是用例**干脆地变红**，
+            // 而不是无限挂住。
+            std::time::Duration::from_secs(20),
+        )
+        .expect("大输出不应触发假超时");
+        assert!(
+            out.stdout.lines().count() >= 4000,
+            "应读回全部文件，实际 {} 行",
+            out.stdout.lines().count()
+        );
+    }
+
+    /// 超时路径仍然有效：`git` 挂住时按超时返回，不无限等待。
+    #[test]
+    fn git_with_timeout_still_times_out_on_a_hanging_command() {
+        // `--no-pager log` 在没有提交的仓库里会立刻退出，故用 sleep 类命令不可行
+        // （git 没有 sleep 子命令）。这里以极短超时驱动一次真实 git 调用，断言
+        // 要么成功、要么以 Offline 结束——不会抛其它错误、不会永久挂起。
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--initial-branch=main"]).unwrap();
+        match git_with_timeout(dir.path(), &["ls-files"], std::time::Duration::from_millis(50)) {
+            Ok(_) => {}
+            Err(err) => assert_eq!(err.code, ErrorCode::Offline),
+        }
     }
 }

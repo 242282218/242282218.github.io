@@ -675,8 +675,9 @@ pub fn publish_commit_message(title: &str) -> String {
 /// 供发布与删除的隔离索引构造复用：内容直接进对象库，不改动工作树。
 pub fn write_blob_helper(workspace: &Workspace, bytes: &[u8]) -> Result<String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
+    use std::process::Stdio;
+    // stdin 必须保留管道：blob 内容经 stdin 传给 `hash-object -w --stdin`。
+    let mut child = crate::util::program_command("git")
         .current_dir(workspace.root())
         .args(["hash-object", "-w", "--stdin"])
         .stdin(Stdio::piped())

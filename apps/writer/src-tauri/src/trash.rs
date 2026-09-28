@@ -1132,7 +1132,7 @@ mod integration {
         // 被删提交仍在远端对象库中可读。
         assert!(env.remote_file_direct("writing", "src/content/blog/hist-a.md").is_none());
         let envs = env.envs();
-        let out = std::process::Command::new("git")
+        let out = crate::util::program_command("git")
             .current_dir(&env.remote)
             .envs(envs.iter().map(|(k, v)| (*k, v.clone())))
             .args(["show", &format!("{before_delete}:src/content/blog/hist-a.md")])

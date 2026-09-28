@@ -94,6 +94,16 @@ impl<'w, 's> SyncEngine<'w, 's> {
         }
     }
 
+    /// 工作区根路径（供只读核对的调用方读取本地跟踪引用）。
+    pub fn workspace_root(&self) -> &std::path::Path {
+        self.workspace.root()
+    }
+
+    /// 本机数据目录句柄（供只读核对的调用方读取版本基线）。
+    pub fn store_handle(&self) -> &LocalStore {
+        self.store
+    }
+
     /// 校验 `origin` 指向的仓库与配置一致。
     ///
     /// 这一步保证软件只会对用户确认过的仓库执行写操作，避免用户输入的任意
@@ -160,6 +170,63 @@ impl<'w, 's> SyncEngine<'w, 's> {
             Ok(Some(git::rev_parse(self.workspace.root(), &tracking)?))
         } else {
             Ok(None)
+        }
+    }
+
+    /// 带超时的 [`Self::fetch`]，供远端核对使用。
+    ///
+    /// 与 [`Self::fetch`] 的区别只在失败语义：超时/断网等错误原样上抛，由调用方
+    /// 转成「未核对」；**不会**回落到上一次的结论。远端确实没有该分支仍是
+    /// `Ok(None)`（区别于「查询失败」）。
+    pub fn fetch_with_timeout(
+        &self,
+        branch: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>> {
+        validate_branch(branch)?;
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        match git::git_with_timeout(
+            self.workspace.root(),
+            &["fetch", "--no-tags", "origin", &refspec],
+            timeout,
+        ) {
+            Ok(_) => {}
+            Err(err) if mentions_missing_remote_ref(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        let tracking = format!("refs/remotes/origin/{branch}");
+        if git::ref_exists(self.workspace.root(), &tracking) {
+            Ok(Some(git::rev_parse(self.workspace.root(), &tracking)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 带超时地读取某个 ref 下指定文章的 Markdown 原文。
+    pub fn markdown_at_with_timeout(
+        &self,
+        rev: &str,
+        article_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>> {
+        let rel = format!("{}{}.md", paths::BLOG_DIR_PREFIX, article_id);
+        paths::validate_managed_rel_path(&rel)?;
+        let spec = format!("{rev}:{rel}");
+        let out = git::git_with_timeout(
+            self.workspace.root(),
+            &["show", &spec],
+            timeout,
+        );
+        match out {
+            Ok(out) => Ok(Some(out.stdout)),
+            Err(err) => {
+                // 该 ref 上确实没有这个文件：不是失败，是「确认不存在」。
+                if is_missing_path_error(&err) {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -586,6 +653,19 @@ fn mentions_missing_remote_ref(err: &WriterError) -> bool {
             || haystack.contains("could not find remote ref")
             || haystack.contains("doesn't exist")
             || haystack.contains("couldn't find remote branch"))
+}
+
+/// 判断错误是否只是「该提交下没有这个文件」。
+///
+/// 与 [`mentions_missing_remote_ref`] 同理：这是**确认不存在**，不是核对失败。
+/// 两者的区别直接决定界面显示「尚未发布」还是「状态待核对」，不能混为一谈。
+pub fn is_missing_path_error(err: &WriterError) -> bool {
+    let haystack = err.detail.as_deref().unwrap_or("").to_lowercase();
+    err.code == ErrorCode::GitFailed
+        && (haystack.contains("does not exist")
+            || haystack.contains("exists on disk, but not in")
+            || haystack.contains("invalid object name")
+            || haystack.contains("path '"))
 }
 
 /// 校验分支名只使用软件受管的分支，避免把任意字符串拼进 refspec。

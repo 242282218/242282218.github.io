@@ -17,14 +17,16 @@ import type {
   DeleteOutcome,
   DeploymentStatus,
   ImportedImage,
+  PreviewDependencyStatus,
   PreviewSessionInfo,
   PublishOutcome,
   PublishPrecheck,
   RecoveryDraft,
+  RemoteCheckOutcome,
   RenameAssessment,
   SyncAssessment,
   SyncOutcome,
-  ToolchainReport,
+  ToolchainState,
   TrashEntry,
   UpdatedDateAction,
   WithdrawOutcome,
@@ -108,11 +110,19 @@ export const backend = {
   acknowledgeDisclosure: () => call<ConnectionStatus>('acknowledge_disclosure'),
   connect: (workspaceDir?: string) =>
     call<ConnectionStatus>('connect', { workspaceDir: workspaceDir ?? null }),
-  toolchainReport: () => call<ToolchainReport>('toolchain_report'),
+  toolchainReport: () => call<ToolchainState>('toolchain_report'),
 
   /** 文章。 */
   listArticles: () => call<ArticleSummary[]>('list_articles'),
   readArticle: (articleId: string) => call<ArticleContent>('read_article', { articleId }),
+  /**
+   * 核对单篇文章的远端状态（联网）。
+   *
+   * 打开文章后异步调用一次，或由用户手动刷新触发。**不在**保存路径上调用：
+   * 保存必须保持离线，否则每次自动保存都会联网核对远端。
+   */
+  checkArticleRemote: (articleId: string) =>
+    call<RemoteCheckOutcome>('check_article_remote', { articleId }),
   createArticle: (articleId: string, meta: ArticleMeta, body: string) =>
     call<ArticleContent>('create_article', { articleId, meta, body }),
   saveArticle: (
@@ -130,6 +140,13 @@ export const backend = {
     }),
   importArticle: (sourcePath: string, articleId: string) =>
     call<ArticleContent>('import_article', { sourcePath, articleId }),
+  /**
+   * 把一篇文章的磁盘原文导出到 `targetPath`（用户经「另存为」选定的绝对路径）。
+   *
+   * 后端只读工作区、只写目标文件；目标落在应用数据目录或受管工作区内时会被拒绝。
+   */
+  exportArticle: (articleId: string, targetPath: string) =>
+    call<void>('export_article', { articleId, targetPath }),
   /** 插入图片：后端校验文件头与大小后归档到 public/blog/<article-id>/。 */
   importArticleImage: (articleId: string, sourcePath: string) =>
     call<ImportedImage>('import_article_image', { articleId, sourcePath }),
@@ -218,6 +235,18 @@ export const backend = {
   startSitePreview: (articleId: string, simulatePublic: boolean) =>
     call<PreviewSessionInfo>('start_site_preview', { articleId, simulatePublic }),
   stopSitePreview: () => call<void>('stop_site_preview'),
+  /** 查询预览依赖准备状态；不启动任务。 */
+  previewDependencyStatus: () =>
+    call<PreviewDependencyStatus>('preview_dependency_status'),
+  /**
+   * 请求准备预览依赖。
+   *
+   * 不等待安装完成：返回 `ready`（已就绪）或 `preparing`（已登记真实任务，
+   * 用 `taskId` 去重）。重复调用不会重复安装。安装失败/超时通过状态查询回报，
+   * 而不是让这次调用挂住数分钟。
+   */
+  preparePreviewDependencies: () =>
+    call<PreviewDependencyStatus>('prepare_preview_dependencies'),
   statusOverview: () => call<ArticleStatus[]>('status_overview'),
 }
 
@@ -230,15 +259,26 @@ export function filterArticles(
     case 'all':
       return articles
     case 'local-only':
-      return articles.filter((a) => a.status.remoteSync !== 'saved')
+      // 「未同步」只包括**已核对**且远端确实没有/不一致的文章；
+      // 「待核对」是未知，混进来会把不知道当成结论。
+      return articles.filter((a) => a.status.remoteSync === 'local-only')
     case 'remote-saved':
       return articles.filter((a) => a.status.remoteSync === 'saved')
     case 'site-published':
       // 「已发布到网站」= 这篇文章已经进入 `main`（含刚提交、部署中、已上线、
       // 部署失败）。只有从未发布与已撤下的不算。刻意不用单一布尔值判断，
       // 避免把「已提交但未上线」误当成已上线、或把部署失败漏掉。
+      // 「待核对」同样排除：那只是还不知道。
       return articles.filter(
-        (a) => a.status.site !== 'never-published' && a.status.site !== 'withdrawn',
+        (a) =>
+          a.status.site !== 'unverified' &&
+          a.status.site !== 'never-published' &&
+          a.status.site !== 'withdrawn',
+      )
+    case 'unverified':
+      // 未知状态单独筛选，让用户能一键找出「还没核对过」的文章。
+      return articles.filter(
+        (a) => a.status.remoteSync === 'unverified' || a.status.site === 'unverified',
       )
     case 'conflict':
       // 解析异常也归入需要处理的一类，避免被静默忽略。

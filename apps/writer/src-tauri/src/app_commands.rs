@@ -13,7 +13,10 @@ use crate::model::{
     ArticleContent, ArticleMeta, ArticleSummary, ArticleStatus, ErrorCode, Result, WriterError,
 };
 use crate::paths;
-use crate::preview::{PreviewEngine, PreviewOverlay, PreviewServer, ToolchainReport};
+use crate::preview::{
+    PreviewDependencyStatus, PreviewDependencyTasks, PreviewEngine, PreviewOverlay, PreviewServer,
+    INSTALL_TIMEOUT,
+};
 use crate::publish::{
     PublishEngine, PublishOutcome, PublishPrecheck, WorkflowConclusion,
 };
@@ -31,6 +34,8 @@ pub struct AppState {
     pub queue: TaskQueue,
     /// 当前活动的预览服务（单实例：新的预览会替换旧的）。
     pub preview: Arc<Mutex<Option<PreviewServer>>>,
+    /// 预览依赖准备任务的登记与状态（单实例：同一时刻只允许一次安装）。
+    pub preview_dependencies: PreviewDependencyTasks,
     /// 工作区排他锁，防止第二个软件实例同时写入。
     pub instance_lock: Option<crate::local_store::InstanceLock>,
 }
@@ -46,6 +51,7 @@ impl AppState {
             store,
             queue: TaskQueue::new(),
             preview: Arc::new(Mutex::new(None)),
+            preview_dependencies: PreviewDependencyTasks::new(),
             instance_lock,
         })
     }
@@ -56,6 +62,7 @@ impl AppState {
             store,
             queue: TaskQueue::new(),
             preview: Arc::new(Mutex::new(None)),
+            preview_dependencies: PreviewDependencyTasks::new(),
             instance_lock: None,
         }
     }
@@ -91,69 +98,97 @@ impl AppState {
         TrashEngine::new(workspace, &self.store, &config.repo_url)
     }
 
-    /// 读取远端快照用于状态推导（离线时返回空快照，状态退化为本地视角）。
+    /// 远端核对的超时上限。断网时 `git fetch` 可能长时间挂住，必须有上限。
+    pub const REMOTE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// 读取远端快照用于状态推导。
+    ///
+    /// **这里不发起任何网络请求**：保存、列表刷新都走这条路径，若在此隐式
+    /// `fetch`，每次自动保存都会联网核对远端（旧行为的主要卡顿来源）。
+    /// 结论只来自两类来源，且都要求「仍可证明有效」：
+    /// 1. 本机缓存（键含仓库与文章，且记录的远端头必须与当前本地跟踪引用一致）；
+    /// 2. 调用方在同一轮里已经核实过的结论（见 [`Self::remote_snapshots_after_check`]）。
+    ///
+    /// 没有可用结论时返回**未核对**，界面据实显示「待核对」而不是「已同步」。
     fn remote_snapshots(&self, workspace: &Workspace, config: &AppConfig) -> BTreeMap<String, RemoteSnapshot> {
-        let engine = self.sync_engine(workspace, config);
+        let repo = crate::git::normalize_remote_url(&config.repo_url);
+        let cache = self.store.load_remote_checks();
         let mut out = BTreeMap::new();
-        let writing_head = engine.fetch(crate::sync::WRITING_BRANCH).ok().flatten();
-        let main_head = engine.fetch(MAIN_BRANCH).ok().flatten();
-        if writing_head.is_none() && main_head.is_none() {
-            return out;
-        }
-
-        let ids: Vec<String> = workspace
-            .list_markdown_rel_paths()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|rel| paths::article_id_from_rel_path(&rel).ok())
-            .collect();
-
-        for article_id in ids {
-            let baseline = self.store.load_versions().get(&article_id).cloned().unwrap_or_default();
-            // 该文章在各分支上的原文；`None` 表示该分支上没有这篇文章。
-            let writing_text = writing_head
-                .as_deref()
-                .and_then(|rev| engine.markdown_at(rev, &article_id).ok().flatten());
-            let main_text = main_head
-                .as_deref()
-                .and_then(|rev| engine.markdown_at(rev, &article_id).ok().flatten());
-
-            let writing_hash = writing_text.as_deref().map(|t| util::hash_bytes(t.as_bytes()));
-            let main_hash = main_text.as_deref().map(|t| util::hash_bytes(t.as_bytes()));
-            let main_site_hash = main_text.as_deref().map(crate::workspace::site_hash_of);
-            let main_published = main_text.as_deref().and_then(|t| {
-                let parsed = crate::article_io::parse_markdown(t).ok()?;
-                let map = crate::article_io::parse_front_matter_map(&parsed.front_matter).ok()?;
-                let meta = crate::article_io::meta_from_map(&map).ok()?;
-                Some(!meta.draft)
-            });
-
-            // `main_commit` 表示「该文章当前 main 版本所在的提交」；文章不在
-            // `main` 上时必须为 `None`，否则状态推导会把从未发布的文章
-            // 显示成「已提交发布」。
-            let main_commit = if main_text.is_some() { main_head.clone() } else { None };
-            let deployment_url =
-                if main_text.is_some() { baseline.deployment_url.clone() } else { None };
-
-            out.insert(
-                article_id.clone(),
-                RemoteSnapshot {
-                    writing_hash,
-                    main_hash,
-                    main_site_hash,
-                    main_commit,
-                    main_published,
-                    // 部署结论只来自**已确认的工作流查询**在基线上的落盘记录，
-                    // 不再由「推送成功」推导。
-                    deployed_commit: baseline.deployed_commit.clone(),
-                    deploy_failed_commit: baseline.deploy_failed_commit.clone(),
-                    deploying_commit: baseline.deploying_commit.clone(),
-                    deployment_url,
-                },
-            );
+        for rel in workspace.list_markdown_rel_paths().unwrap_or_default() {
+            let Ok(article_id) = paths::article_id_from_rel_path(&rel) else {
+                continue;
+            };
+            let entry = cache.get(&repo, &article_id);
+            out.insert(article_id, self.snapshot_from_cache(workspace, entry));
         }
         out
     }
+
+    /// 把一条缓存记录转换成快照；缓存已失效时两个分支都是「未核对」。
+    ///
+    /// 复用条件：仓库键一致（已由查表保证）、且记录里的远端头仍等于本地跟踪引用。
+    /// 远端可能已经前进，因此**必须**先能读到当前跟踪头才允许复用。
+    fn snapshot_from_cache(
+        &self,
+        workspace: &Workspace,
+        entry: Option<&crate::local_store::RemoteCheckEntry>,
+    ) -> RemoteSnapshot {
+        let Some(entry) = entry else {
+            return RemoteSnapshot::default();
+        };
+        let mut snapshot = RemoteSnapshot {
+            writing: entry.writing.clone(),
+            main: entry.main.clone(),
+            ..Default::default()
+        };
+        // 逐个分支复核：跟踪引用读不到（从未 fetch 过）或头已前进，都视为失效。
+        for (branch, check) in [
+            (crate::sync::WRITING_BRANCH, &mut snapshot.writing),
+            (MAIN_BRANCH, &mut snapshot.main),
+        ] {
+            let current = crate::git::rev_parse(
+                workspace.root(),
+                &format!("refs/remotes/origin/{branch}"),
+            )
+            .ok();
+            if current.is_none() || current != check.head {
+                *check = crate::model::BranchCheck::unverified(
+                    "远端可能已变化，需要重新核对（缓存仅在上次核对时的头未变时可用）",
+                );
+            }
+        }
+        // 部署结论也与 main 头绑定；main 未核对时不得据此判断上线状态。
+        if !snapshot.main.is_verified() {
+            snapshot.deployed_commit = None;
+            snapshot.deploy_failed_commit = None;
+            snapshot.deploying_commit = None;
+        }
+        snapshot
+    }
+
+    /// 写入一份核对结论到缓存（只在两个分支都确实核对过时记录）。
+    fn store_remote_check(
+        &self,
+        repo: &str,
+        article_id: &str,
+        snapshot: &RemoteSnapshot,
+    ) -> Result<()> {
+        if !snapshot.writing.is_verified() && !snapshot.main.is_verified() {
+            return Ok(());
+        }
+        let mut cache = self.store.load_remote_checks();
+        cache.put(
+            repo,
+            article_id,
+            crate::local_store::RemoteCheckEntry {
+                writing: snapshot.writing.clone(),
+                main: snapshot.main.clone(),
+                repo: repo.to_string(),
+            },
+        );
+        self.store.save_remote_checks(&cache)
+    }
+
 }
 
 /// 应用数据目录的克隆句柄。
@@ -192,13 +227,16 @@ pub fn connect(
     state.connector().connect(dir)
 }
 
-/// 能力检测（Git / Node / pnpm）。
-pub fn toolchain_report(state: &AppState) -> ToolchainReport {
-    let _ = state;
-    crate::preview::check_toolchain()
+/// 能力检测（Git / Node / pnpm）：用户显式触发的真实探测。
+///
+/// 探测结果落盘，之后启动路径直接读缓存，不必每次都跑进程。
+pub fn run_toolchain_check(state: &AppState) -> Result<crate::preview::ToolchainState> {
+    state.connector().run_toolchain_check()
 }
 
 /// 文章列表（带三处状态）。
+///
+/// 只读本地数据与**仍可证明有效**的远端缓存，不做任何隐式网络请求。
 pub fn list_articles(state: &AppState) -> Result<Vec<ArticleSummary>> {
     let workspace = state.workspace()?;
     let config = state.config();
@@ -206,7 +244,7 @@ pub fn list_articles(state: &AppState) -> Result<Vec<ArticleSummary>> {
     workspace.scan(&state.store, &snapshots)
 }
 
-/// 读取单篇文章。
+/// 读取单篇文章。与列表同源：本地优先，远端结论只来自有效缓存。
 pub fn read_article(state: &AppState, article_id: String) -> Result<ArticleContent> {
     validate_article_id(&article_id)?;
     let workspace = state.workspace()?;
@@ -214,6 +252,145 @@ pub fn read_article(state: &AppState, article_id: String) -> Result<ArticleConte
     let snapshots = state.remote_snapshots(&workspace, &config);
     workspace.read(&article_id, &snapshots)
 }
+
+/// 一次远端核对的结果（可直接交给前端替换当前文章的状态）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCheckOutcome {
+    pub article_id: String,
+    /// 核对时本地磁盘原文的哈希。
+    ///
+    /// 前端据此丢弃过期结果：核对期间用户可能已经继续编辑，或切换到了别的文章；
+    /// 那种情况下这个哈希与当前文章对不上，结果必须整个丢弃，不能只更新状态字段。
+    pub local_body_hash: String,
+    pub status: ArticleStatus,
+}
+
+/// 核对单篇文章在两个远端分支上的状态（会联网）。
+///
+/// 这是「打开文章后异步核对一次」与「手动刷新远端状态」共用的实现：
+/// - 两个分支**分别**得出「未核对 / 确认不存在 / 有内容」，一支失败不影响另一支；
+/// - 超时、断网、认证失败等都是「未核对」并带上原因，**绝不复用旧结论**；
+/// - 成功核对后写入缓存（键含仓库与文章，值为结论及其依据的远端头）。
+///
+/// 返回带本地哈希的完整结论；调用方负责核对哈希后再写回界面。
+pub fn check_article_remote(state: &AppState, article_id: String) -> Result<RemoteCheckOutcome> {
+    validate_article_id(&article_id)?;
+    let workspace = state.workspace()?;
+    let config = state.config();
+    let engine = state.sync_engine(&workspace, &config);
+    let repo = crate::git::normalize_remote_url(&config.repo_url);
+
+    // 每个分支独立核对：结论之间互不牵连。
+    let writing = check_one_branch(&engine, crate::sync::WRITING_BRANCH, &article_id);
+    let main = check_one_branch(&engine, MAIN_BRANCH, &article_id);
+
+    let baseline = state.store.load_versions().get(&article_id).cloned().unwrap_or_default();
+    // 部署结论只来自**已确认的工作流查询**在基线上的落盘记录，且只在 main
+    // 确实核对过时才允许参与上线判断。
+    let snapshot = RemoteSnapshot {
+        writing,
+        main,
+        deployed_commit: baseline.deployed_commit.clone(),
+        deploy_failed_commit: baseline.deploy_failed_commit.clone(),
+        deploying_commit: baseline.deploying_commit.clone(),
+    };
+
+    state.store_remote_check(&repo, &article_id, &snapshot)?;
+
+    // 本地内容只读一次，再由同一份字节推出顶层哈希与状态里的全部字段。
+    let raw = workspace.read_raw(&article_id)?.unwrap_or_default();
+    Ok(outcome_from_local_bytes(article_id, &raw, snapshot))
+}
+
+/// 由**同一份**本地字节与远端快照构造核对结论。
+///
+/// 单独抽出来是为了让「结论自洽」这条不变量可以被**确定性地**测试：
+/// 顶层 `local_body_hash` 与状态里的本地/网站哈希必须同源。若实现改成读盘两次
+/// （一次算哈希、一次算网站哈希），两次之间落盘的新内容就会让结论自相矛盾——
+/// 而这只有把「一份字节 → 一条结论」做成纯函数才能稳定断言，靠并发赛跑是概率性的
+/// （实测：把实现改回两次读盘，并发用例仍然照常通过）。
+pub fn outcome_from_local_bytes(
+    article_id: String,
+    raw: &[u8],
+    snapshot: RemoteSnapshot,
+) -> RemoteCheckOutcome {
+    let local_hash = util::hash_bytes(raw);
+    let local_text = String::from_utf8_lossy(raw).into_owned();
+    let status = crate::workspace::derive_status(&crate::workspace::StatusInputs {
+        local_hash: local_hash.clone(),
+        local_site_hash: crate::workspace::site_hash_of(&local_text),
+        locally_saved: true,
+        remote: snapshot,
+    });
+    RemoteCheckOutcome { article_id, local_body_hash: local_hash, status }
+}
+
+/// 核对一个分支上该文章的状态。
+///
+/// 任何失败都转成「未核对 ＋ 原因」，而不是返回错误：打开文章时的核对是后台
+/// 补足信息，不应因为断网就打断编辑。真正的错误留给同步/发布自己的预检流程。
+fn check_one_branch(
+    engine: &SyncEngine<'_, '_>,
+    branch: &str,
+    article_id: &str,
+) -> crate::model::BranchCheck {
+    let checked_at = util::unix_seconds();
+    let head = match engine.fetch_with_timeout(branch, AppState::REMOTE_CHECK_TIMEOUT) {
+        Ok(Some(head)) => head,
+        // 远端确实没有这个分支：已核对，确认不存在。
+        Ok(None) => return crate::model::BranchCheck::absent(None, checked_at),
+        Err(err) => {
+            return crate::model::BranchCheck::unverified(check_failure_reason(branch, &err));
+        }
+    };
+
+    let text = match engine.markdown_at_with_timeout(&head, article_id, AppState::REMOTE_CHECK_TIMEOUT) {
+        Ok(Some(text)) => text,
+        Ok(None) => return crate::model::BranchCheck::absent(Some(head), checked_at),
+        Err(err) => {
+            return crate::model::BranchCheck::unverified(check_failure_reason(branch, &err));
+        }
+    };
+
+    // 已核对且存在：front matter 解析失败不影响「存在」这一事实，只是少了公开性信息。
+    let published = crate::article_io::parse_markdown(&text).ok().and_then(|parsed| {
+        let map = crate::article_io::parse_front_matter_map(&parsed.front_matter).ok()?;
+        let meta = crate::article_io::meta_from_map(&map).ok()?;
+        Some(!meta.draft)
+    });
+    let deployment_url = if branch == MAIN_BRANCH {
+        engine
+            .store_handle()
+            .load_versions()
+            .get(article_id)
+            .and_then(|baseline| baseline.deployment_url.clone())
+    } else {
+        None
+    };
+
+    crate::model::BranchCheck::present(
+        Some(head),
+        checked_at,
+        util::hash_bytes(text.as_bytes()),
+        Some(crate::workspace::site_hash_of(&text)),
+        published,
+        deployment_url,
+    )
+}
+
+/// 把核对失败转成面向用户的原因说明。
+fn check_failure_reason(branch: &str, err: &WriterError) -> String {
+    let label = if branch == MAIN_BRANCH { "网站分支" } else { "写作分支" };
+    let cause = match err.code {
+        ErrorCode::Offline => "网络不可用或核对超时",
+        ErrorCode::AuthFailed => "认证失败",
+        ErrorCode::ToolchainMissing => "未找到 Git",
+        _ => "读取远端失败",
+    };
+    format!("{label}状态待核对：{cause}")
+}
+
 
 /// 新建文章：默认 `draft: true`，在第一次发布时才切换主站文件。
 pub fn create_article(
@@ -409,9 +586,49 @@ pub fn import_article(
     Ok(imported)
 }
 
-/// 评估一篇文章能否安全同步（差异界面数据源）。
-pub fn assess_sync(state: &AppState, article_id: String) -> Result<SyncAssessment> {
+/// 把一篇文章的**磁盘原文**导出到用户选定的绝对路径。
+///
+/// 只读工作区、只写目标文件；不进入受管目录、不动 Git、不更新任何索引。
+/// 目标路径来自系统「另存为」对话框，与 [`import_article`] 属同一信任级别。
+///
+/// 额外拒绝落在应用数据目录或受管工作区内的目标：这两处是软件自己管理的状态
+/// （配置、恢复副本、版本基线、仓库工作树），误覆盖会造成不可逆损失，而「导出」
+/// 没有写入这两处的正当理由。
+pub fn export_article(state: &AppState, article_id: String, target_path: String) -> Result<()> {
     validate_article_id(&article_id)?;
+    let target = PathBuf::from(target_path.trim());
+    if !target.is_absolute() {
+        return Err(WriterError::new(
+            ErrorCode::InvalidArgument,
+            "请选择要导出的目标文件（绝对路径）",
+        ));
+    }
+    let workspace = state.workspace()?;
+    if target.starts_with(workspace.root()) {
+        return Err(WriterError::new(
+            ErrorCode::InvalidArgument,
+            "目标位于受管工作区内。导出请选择工作区以外的位置",
+        ));
+    }
+    if crate::connection::is_inside_app_data(&state.store, &target) {
+        return Err(WriterError::new(
+            ErrorCode::InvalidArgument,
+            "目标位于应用数据目录内。导出请选择该目录以外的位置",
+        ));
+    }
+    // 字符串前缀比较挡不住符号链接/目录联接：目标（或其父目录）若是指向受管
+    // 位置的链接，`fs::write` 会跟随链接写进受管目录，绕过上面两条检查。
+    crate::util::verify_output_path_not_link(&target)?;
+    let bytes = workspace.read_raw(&article_id)?.ok_or_else(|| {
+        WriterError::new(ErrorCode::ArticleNotFound, "找不到这篇文章的本地文件")
+    })?;
+    std::fs::write(&target, &bytes).map_err(|err| {
+        WriterError::new(ErrorCode::IoFailed, format!("写入导出文件失败：{err}"))
+    })?;
+    Ok(())
+}
+/// 评估一篇文章能否安全同步（差异界面数据源）。
+pub fn assess_sync(state: &AppState, article_id: String) -> Result<SyncAssessment> {    validate_article_id(&article_id)?;
     let workspace = state.workspace()?;
     state.sync_engine(&workspace, &state.config()).assess(&article_id)
 }
@@ -743,6 +960,10 @@ pub fn set_preferences(state: &AppState, preferences: WritingPreferences) -> Res
 /// 启动网站预览。
 ///
 /// 在隔离临时副本中覆盖当前文章内容，只绑定 `127.0.0.1`。
+///
+/// **本函数不安装依赖**：安装可能持续数分钟，只能由用户显式触发的
+/// [`prepare_site_preview_dependencies`] 完成。缺依赖时这里立刻返回明确的
+/// 「需准备依赖」状态，绝不静默安装、也绝不声称有后台任务在跑。
 pub fn start_site_preview(
     state: &AppState,
     article_id: String,
@@ -771,16 +992,15 @@ pub fn start_site_preview(
         images: image_bytes,
         simulate_public,
     };
-    let _ = config;
 
-    run_exclusive(&state.queue, TaskKind::SitePreview, "site", || {
+    let info = run_exclusive(&state.queue, TaskKind::SitePreview, "site", || {
         let worktree = engine.prepare_worktree(&paths::case_insensitive_key(&article_id).replace('/', "-"))?;
         engine.apply_overlay(&worktree, &overlay)?;
 
-        // 依赖：优先复用工作区已安装的那份（目录联接），避免重复下载。
-        let reused = engine.ensure_dependencies(&worktree)?;
-        if reused {
-            let _ = reused;
+        // 只复用工作区已有的依赖；缺失时报「需准备依赖」并清理本次副本。
+        if let Err(err) = engine.require_dependencies(&worktree) {
+            let _ = crate::util::remove_dir_all_no_follow(&worktree);
+            return Err(err);
         }
 
         let server = engine.start(&worktree)?;
@@ -799,7 +1019,47 @@ pub fn start_site_preview(
             offline_font_notice: Some(crate::preview::OFFLINE_FONT_NOTICE.to_string()),
             simulate_public,
         })
-    })
+    })?;
+    // 启动成功即证明依赖可用，把状态校正为「已就绪」。
+    state.preview_dependencies.mark_ready();
+    Ok(info)
+}
+
+/// 查询预览依赖的准备状态（不启动任何任务）。
+pub fn preview_dependency_status(state: &AppState) -> PreviewDependencyStatus {
+    state.preview_dependencies.status()
+}
+
+/// 请求准备网站预览依赖。
+///
+/// 返回的是**真实状态**：
+/// - 依赖已就绪 → `Ready`（不启动任务）；
+/// - 已有准备任务在跑 → 返回该任务（同一个 `task_id`），不会重复安装；
+/// - 否则登记并启动一个带任务标识的后台任务，返回 `Preparing`。
+///
+/// 工作区不可用等**无法启动任务**的情况返回 `Err`，此时不会留下任何
+/// 「正在进行」的假状态。
+pub fn prepare_site_preview_dependencies(state: &AppState) -> Result<PreviewDependencyStatus> {
+    if state.preview_dependencies.status().is_preparing() {
+        return Ok(state.preview_dependencies.status());
+    }
+    let workspace = state.workspace()?;
+    let config = state.config();
+    let temp_base = state.connector().preview_temp_root();
+    let repo_url = config.repo_url.clone();
+
+    let engine = PreviewEngine::new(&workspace, temp_base.clone(), &repo_url);
+    if engine.workspace_dependencies_ready() {
+        return Ok(state.preview_dependencies.mark_ready());
+    }
+
+    // 后台线程只能持有拥有型数据：工作区与引擎都在线程内重建。
+    let root = workspace.root().to_path_buf();
+    Ok(state.preview_dependencies.start(move || {
+        let workspace = Workspace::open(root)?;
+        let engine = PreviewEngine::new(&workspace, temp_base, &repo_url);
+        engine.prepare_dependencies(INSTALL_TIMEOUT)
+    }))
 }
 
 /// 关闭网站预览并清理临时目录。
@@ -880,7 +1140,7 @@ fn fetch_workflow_conclusion(repo_label: &str) -> Result<Option<WorkflowConclusi
     let url = format!(
         "https://api.github.com/repos/{repo_label}/actions/workflows/deploy.yml/runs?per_page=1"
     );
-    let output = std::process::Command::new("curl")
+    let output = crate::util::program_command("curl")
         .args(["-sS", "-m", "15", "-H", "Accept: application/vnd.github+json", &url])
         .output();
 
@@ -943,7 +1203,6 @@ pub struct RenameAssessment {
 pub fn status_overview(state: &AppState) -> Result<Vec<ArticleStatus>> {
     Ok(list_articles(state)?.into_iter().map(|s| s.status).collect())
 }
-
 impl Default for AppState {
     fn default() -> Self {
         Self::with_store(LocalStore::open_default().expect("应用数据目录不可用"))
@@ -1270,6 +1529,190 @@ mod tests {
     }
 
     #[test]
+    fn shell_theme_defaults_to_system_and_clamps_unknown_values() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        // 默认跟随系统。
+        assert_eq!(get_preferences(&state).shell_theme, "system");
+
+        let mut prefs = get_preferences(&state);
+        prefs.shell_theme = "dark".to_string();
+        assert_eq!(set_preferences(&state, prefs).unwrap().shell_theme, "dark");
+
+        // 未知取值退回「跟随系统」，不留一个没有消费者的字符串。
+        let mut prefs = get_preferences(&state);
+        prefs.shell_theme = "neon".to_string();
+        assert_eq!(set_preferences(&state, prefs).unwrap().shell_theme, "system");
+    }
+
+    /// 旧版 `config.json` 没有 `shellTheme` 字段，反序列化不能失败。
+    ///
+    /// 失败会被 `load_config` 判为「配置损坏」并把整份配置重置为默认值，
+    /// 用户的仓库地址与其他偏好一并丢失。
+    #[test]
+    fn config_without_shell_theme_still_loads_other_preferences() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        let mut prefs = get_preferences(&state);
+        prefs.font_size = 21;
+        prefs.code_theme = "monokai".to_string();
+        set_preferences(&state, prefs).unwrap();
+
+        // 抹掉字段，模拟旧版写入的文件。
+        // 用 JSON 层删除而不是字符串替换：缩进由 pretty 输出决定，替换串很脆。
+        let path = state.store.root().join("config.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let removed = value
+            .get_mut("preferences")
+            .and_then(|prefs| prefs.as_object_mut())
+            .and_then(|prefs| prefs.remove("shellTheme"));
+        assert!(removed.is_some(), "写入的配置里应有 shellTheme 字段");
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("shellTheme"));
+
+        let loaded = get_preferences(&state);
+        assert_eq!(loaded.shell_theme, "system", "缺失字段应回落到默认值");
+        assert_eq!(loaded.font_size, 21, "其他偏好必须原样保留，不能被重置");
+        assert_eq!(loaded.code_theme, "monokai");
+        // 且原文件没有被改名成 .bak（那是「配置损坏」分支才会做的事）。
+        assert!(!state.store.root().join("config.json.bak").exists());
+    }
+
+    #[test]
+    fn export_writes_disk_bytes_and_refuses_managed_targets() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "exp-a".to_string(), meta("导出示例"), "正文内容".to_string())
+            .unwrap();
+        let source_bytes = state
+            .workspace()
+            .unwrap()
+            .read_raw("exp-a")
+            .unwrap()
+            .expect("文章已落盘");
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("导出的副本.md");
+        export_article(
+            &state,
+            "exp-a".to_string(),
+            target.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        // 导出的是磁盘原文，逐字节相同（不是 render() 规范化后的结果）。
+        assert_eq!(std::fs::read(&target).unwrap(), source_bytes);
+
+        // 导出不改动工作区。
+        assert_eq!(
+            state.workspace().unwrap().read_raw("exp-a").unwrap().unwrap(),
+            source_bytes,
+        );
+
+        // 相对路径被拒绝。
+        let err = export_article(&state, "exp-a".to_string(), "copy.md".to_string()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+
+        // 受管工作区内的目标被拒绝，且不产生文件。
+        let workspace = state.workspace().unwrap();
+        let inside = workspace.root().join("exported.md");
+        let err = export_article(
+            &state,
+            "exp-a".to_string(),
+            inside.to_string_lossy().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(!inside.exists());
+
+        // 应用数据目录内的目标被拒绝。
+        let in_data = state.store.root().join("exported.md");
+        let err = export_article(
+            &state,
+            "exp-a".to_string(),
+            in_data.to_string_lossy().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(!in_data.exists());
+
+        // 文章不存在时如实报错。
+        let err = export_article(
+            &state,
+            "missing".to_string(),
+            outside.path().join("x.md").to_string_lossy().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ArticleNotFound);
+    }
+
+    /// P1 回归：导出目标若经由链接指向受管位置，字符串前缀检查挡不住。
+    ///
+    /// `std::fs::write` 会跟随链接，因此「目标路径不在工作区内」并不等于「写入
+    /// 落在工作区外」。夹具用 **Windows 目录联接**（无需管理员权限，与
+    /// `workspace.rs` 里的逃逸测试同法）：`outside/into-managed` → 工作区根，
+    /// 导出到 `outside/into-managed/<文件名>` 若被放行，就会覆盖软件自己管理的文件。
+    #[test]
+    fn export_refuses_target_reaching_managed_areas_through_a_link() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "exp-link".to_string(), meta("链接导出"), "正文".to_string())
+            .unwrap();
+        let workspace = state.workspace().unwrap();
+        // 受管文章的真实路径：`src/content/blog/<id>.md`（不是工作区根）。
+        let victim_rel = format!("{}exp-link.md", crate::paths::BLOG_DIR_PREFIX);
+        let victim = workspace.root().join(&victim_rel);
+        assert!(victim.exists(), "夹具前提：受管文件存在于 {victim_rel}");
+
+        let outside = tempfile::tempdir().unwrap();
+        let junction = outside.path().join("into-managed");
+        if !create_dir_junction(workspace.root(), &junction) {
+            eprintln!("[跳过] 本机不允许创建目录联接");
+            return;
+        }
+        // 经联接指向工作区里的真实文章文件。
+        let target = junction.join(&victim_rel);
+
+        // 字符串层面：目标既不在工作区前缀内，也不在应用数据目录内。
+        assert!(!target.starts_with(workspace.root()));
+        assert!(!crate::connection::is_inside_app_data(&state.store, &target));
+
+        let before = state.workspace().unwrap().read_raw("exp-link").unwrap().unwrap();
+        let err = export_article(
+            &state,
+            "exp-link".to_string(),
+            target.to_string_lossy().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PathOutOfScope);
+        // 受管位置的文件必须逐字节未变。
+        assert_eq!(
+            state.workspace().unwrap().read_raw("exp-link").unwrap().unwrap(),
+            before,
+            "经链接落到受管目录的导出必须被拒绝，且原文件不得被改写",
+        );
+        // 清理联结，避免临时目录删除时跟随链接。
+        let _ = std::fs::remove_dir(&junction);
+    }
+
+    /// 创建一个指向 `target` 的 Windows 目录联接；失败返回 false（由调用方跳过）。
+    #[cfg(windows)]
+    fn create_dir_junction(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    fn create_dir_junction(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[test]
     fn status_overview_matches_article_count() {
         let env = TestEnv::new();
         let state = state_for(&env);
@@ -1305,25 +1748,48 @@ mod tests {
     /// 旧缺陷：`remote_snapshots` 把仓库级 `main` 头填进每篇文章的
     /// `main_commit`，于是「从未发布的文章」在列表里显示成「已提交发布」，
     /// 「刚推送、部署未核实」显示成「网站已上线」。
+    ///
+    /// A5 之后列表**不再隐式联网**，因此结论必须由显式核对产生：
+    /// 核对前是「待核对」，核对到「两分支都没有」才是「从未发布」。
     #[test]
     fn list_status_never_claims_live_without_deploy_confirmation() {
         let env = TestEnv::new();
         let state = state_for(&env);
 
-        // 1) 从未发布：列表不得显示成已提交发布。
+        // 0) 核对之前：列表只能显示「待核对」，不得断言从未发布。
         create_article(&state, "ls-never".to_string(), meta("从未发布"), "正文".to_string()).unwrap();
+        let listed = list_articles(&state).unwrap();
+        let fresh = listed.iter().find(|a| a.id == "ls-never").unwrap();
+        assert_eq!(
+            fresh.status.site,
+            crate::model::SiteState::Unverified,
+            "未经核对不得给出网站结论：{fresh:?}"
+        );
+        assert_eq!(fresh.status.remote_sync, crate::model::RemoteSync::Unverified);
+
+        // 1) 显式核对后：远端确实没有该文章 → 从未发布，且不得显示成已提交发布。
+        check_article_remote(&state, "ls-never".to_string()).unwrap();
         let listed = list_articles(&state).unwrap();
         let never = listed.iter().find(|a| a.id == "ls-never").unwrap();
         assert_eq!(
             never.status.site,
             crate::model::SiteState::NeverPublished,
-            "从未发布的文章不得显示成已提交发布：{never:?}"
+            "核对确认不存在后才能说从未发布：{never:?}"
         );
-        assert!(never.status.main_commit.is_none());
+        assert_eq!(
+            never.status.main.state,
+            crate::model::CheckState::Absent,
+            "文章不在 main 上，必须表达为「确认不存在」而不是「有内容」"
+        );
+        assert!(
+            never.status.main.body_hash.is_none(),
+            "确认不存在时不得携带任何内容哈希"
+        );
 
         // 2) 推送成功但部署未核实：不得显示成已上线。
         sync_article(&state, "ls-never".to_string(), false).unwrap();
         publish_article(&state, "ls-never".to_string(), Vec::new(), None).unwrap();
+        check_article_remote(&state, "ls-never".to_string()).unwrap();
         let listed = list_articles(&state).unwrap();
         let pushed = listed.iter().find(|a| a.id == "ls-never").unwrap();
         assert_ne!(
@@ -1442,12 +1908,19 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_report_is_available_through_commands() {
+    fn toolchain_check_is_explicit_and_recorded() {
         let env = TestEnv::new();
         let state = state_for(&env);
-        let report = toolchain_report(&state);
+
+        // 启动路径：只有「尚未检查」，且不派生任何探测进程。
+        assert_eq!(state.connector().toolchain_state(), crate::preview::ToolchainState::Unchecked);
+
+        // 显式触发后才产生真实结论，并落盘供后续读取。
+        let checked = run_toolchain_check(&state).unwrap();
+        let report = checked.verified().expect("本机应能完成环境检查");
         // 结构完整；缺项与指引一一对应。
         assert_eq!(report.missing.len(), report.guidance.len());
+        assert!(state.connector().toolchain_state().is_checked(), "检查结果应被记录");
     }
 
     #[test]
@@ -1841,5 +2314,410 @@ mod tests {
             "被另一篇引用的图片必须列入保护：{assessment:?}"
         );
         assert!(assessment.exclusive_images.is_empty());
+    }
+
+    // ---------------------------------------------------------------- A2.4 竞态
+
+    /// 磁盘上文章原文的哈希（与命令层同一基准：磁盘原文字节）。
+    fn disk_hash(env: &TestEnv, article_id: &str) -> String {
+        util::hash_file(&env.path().join(format!("src/content/blog/{article_id}.md"))).unwrap()
+    }
+
+    /// A2.4：`check_article_remote` 返回的 `local_body_hash` 必须是**核对当时磁盘原文**
+    /// 的哈希，而不是某次更早或更晚读取的结果。
+    ///
+    /// 这是前端丢弃迟到结果的唯一依据：只有哈希与当前磁盘内容一致，这条结论才
+    /// 还成立。哈希来源一旦与结论依据的内容版本脱节，「旧结论冒充当前状态」
+    /// 就无法被发现。
+    #[test]
+    fn remote_check_hash_matches_disk_content_at_check_time() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "race-hash".to_string(), meta("核对哈希"), "第一版正文\n".to_string())
+            .unwrap();
+        let hash_before = disk_hash(&env, "race-hash");
+
+        let outcome = check_article_remote(&state, "race-hash".to_string()).unwrap();
+        assert_eq!(
+            outcome.local_body_hash, hash_before,
+            "核对结果必须携带核对当时磁盘原文的哈希"
+        );
+        // 结论内部自洽：status 里的本地哈希与顶层哈希必须是同一份内容。
+        assert_eq!(
+            outcome.status.local_body_hash, outcome.local_body_hash,
+            "结论与其依据的本地版本必须成套"
+        );
+        assert_eq!(
+            hash_before,
+            util::hash_bytes(
+                std::fs::read(env.path().join("src/content/blog/race-hash.md")).unwrap().as_slice()
+            ),
+            "哈希基准是磁盘原文，不是 render() 的规范化结果"
+        );
+    }
+
+    /// A2.4：核对之后磁盘内容变了，那条旧结论的哈希必须与当前磁盘内容不符，
+    /// 使调用方可以整条丢弃，而不是把旧远端结论当成本地新内容的当前状态。
+    #[test]
+    fn stale_check_outcome_is_detectably_outdated_after_a_save() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "race-stale".to_string(), meta("迟到结论"), "旧正文\n".to_string())
+            .unwrap();
+        sync_article(&state, "race-stale".to_string(), false).unwrap();
+
+        // 核对当时的结论（写作分支上确实有内容）。
+        let stale = check_article_remote(&state, "race-stale".to_string()).unwrap();
+        assert_eq!(stale.status.writing.state, crate::model::CheckState::Present);
+
+        // 用户继续编辑并保存：磁盘原文哈希改变。
+        save_article(
+            &state,
+            "race-stale".to_string(),
+            meta("迟到结论"),
+            "全新的正文\n".to_string(),
+            None,
+        )
+        .unwrap();
+        let current = read_article(&state, "race-stale".to_string()).unwrap();
+        assert_ne!(
+            stale.local_body_hash, current.content_hash,
+            "本地已改动时，旧结论的哈希必须与当前磁盘不符（前端据此丢弃）"
+        );
+
+        // 重新核对得到的是当前内容的结论，且哈希与磁盘当前内容一致。
+        let fresh = check_article_remote(&state, "race-stale".to_string()).unwrap();
+        assert_eq!(fresh.local_body_hash, current.content_hash);
+        assert_ne!(fresh.local_body_hash, stale.local_body_hash);
+    }
+
+    /// A2.4：同篇文章并发「保存」与「核对」时，核对返回的结论必须由**同一份**
+    /// 磁盘字节推出，不能是两次读取之间的混合结果。
+    ///
+    /// 修复前 `check_article_remote` 分别读盘算 `local_hash` 与 `site_hash`；
+    /// 两次读取之间落盘的新内容会让返回的结论自相矛盾——`local_body_hash` 属于
+    /// 一版，网站结论却属于另一版，于是「旧远端结论冒充当前状态」。
+    ///
+    /// **确定性部分**（真正守住这条不变量的是下一个用例
+    /// `outcome_is_self_consistent_for_any_local_bytes`）：把「一份字节 → 一条结论」
+    /// 做成纯函数后，可以直接喂进任意字节来断言同源。
+    ///
+    /// 本用例只做**并发冒烟**：核对末尾的读盘窗口只有微秒级，靠赛跑命中它是概率事件，
+    /// 轮数开大就会显著拖慢测试（实测 80 轮约 114 秒）。因此这里只跑少量轮数，
+    /// 确认并发环境下结论不崩、且两个版本都被观察到过；不把「能变红」的责任压在这里。
+    #[test]
+    fn concurrent_save_and_check_produce_a_consistent_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "race-mix".to_string(), meta("并发核对"), "甲版正文\n".to_string())
+            .unwrap();
+        // 先发布，让 `main` 上有一份可比较的网站版本（远端在循环期间不再变化）。
+        sync_article(&state, "race-mix".to_string(), false).unwrap();
+        publish_article(&state, "race-mix".to_string(), Vec::new(), None).unwrap();
+
+        let body_a = "甲版正文\n".to_string();
+        let body_b = "乙版正文，长度与上一版不同\n".to_string();
+        let markdown_of = |body: &str| crate::article_io::compose_markdown(&meta("并发核对"), body);
+        let hash_a = util::hash_bytes(markdown_of(&body_a).as_bytes());
+        let hash_b = util::hash_bytes(markdown_of(&body_b).as_bytes());
+
+        // 基线：记录「已确认部署成功」，使状态推导能区分「已上线」与「网站仍是旧版」。
+        let baseline = check_article_remote(&state, "race-mix".to_string()).unwrap();
+        let main_head = baseline.status.main.head.clone().expect("发布后 main 上应有该文章");
+        state
+            .store
+            .update_baseline("race-mix", |entry| {
+                entry.deployed_commit = Some(main_head.clone());
+            })
+            .unwrap();
+        let baseline = check_article_remote(&state, "race-mix".to_string()).unwrap();
+        let main_site_hash = baseline
+            .status
+            .main
+            .site_hash
+            .clone()
+            .expect("发布后 main 上应有网站哈希");
+        assert_eq!(
+            baseline.status.site,
+            crate::model::SiteState::LiveCurrentVersion,
+            "前置条件：甲版应已是网站当前版本"
+        );
+
+        let article_path = env.path().join("src/content/blog/race-mix.md");
+        let stop = AtomicBool::new(false);
+        // 断言失败会 unwind；`thread::scope` 会先 join 子线程再继续展开，因此
+        // 守卫必须定义在闭包**内部**：若放在闭包外，写入线程会一直跑下去，
+        // 测试表现为挂住而不是干净地失败。
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        std::thread::scope(|scope| {
+            let _guard = StopOnDrop(&stop);
+            // 直接改盘：让磁盘内容在核对末尾读盘时可能正好换了一版。
+            // 用与产品保存路径相同的原子写：裸 `fs::write` 会先把文件截成 0 字节，
+            // 读者可能读到空文件，那是夹具失真而不是产品行为。
+            let writer = scope.spawn(|| {
+                let versions = [markdown_of(&body_a), markdown_of(&body_b)];
+                let mut index = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    crate::article_io::atomic_write(&article_path, versions[index % 2].as_bytes())
+                        .unwrap();
+                    index += 1;
+                }
+            });
+
+            let mut seen_a = false;
+            let mut seen_b = false;
+            for round in 0..8 {
+                let outcome = check_article_remote(&state, "race-mix".to_string()).unwrap();
+
+                assert!(
+                    outcome.local_body_hash == hash_a || outcome.local_body_hash == hash_b,
+                    "核对结果必须是某一完整版本的哈希，实际 {}",
+                    outcome.local_body_hash
+                );
+                assert_eq!(
+                    outcome.status.local_body_hash, outcome.local_body_hash,
+                    "状态结论必须与顶层哈希属于同一版本"
+                );
+
+                if outcome.local_body_hash == hash_a {
+                    seen_a = true;
+                } else {
+                    seen_b = true;
+                }
+
+                // 甲版正是 main 上的内容，乙版是本地新稿。整条结论必须与
+                // `local_body_hash` 指的那一版**完全对上**；混合读取会把甲版的
+                // 「已上线」或乙版的「网站仍是旧版」错配到另一版上。
+                let expected = if outcome.local_body_hash == hash_a {
+                    crate::model::SiteState::LiveCurrentVersion
+                } else {
+                    crate::model::SiteState::LiveOldVersion
+                };
+                assert_eq!(
+                    outcome.status.site, expected,
+                    "第 {round} 轮的网站结论与它携带的本地版本不一致（哈希 {}）",
+                    outcome.local_body_hash
+                );
+                let version_body =
+                    if outcome.local_body_hash == hash_a { &body_a } else { &body_b };
+                assert_eq!(
+                    crate::workspace::site_hash_of(&markdown_of(version_body)) == main_site_hash,
+                    expected == crate::model::SiteState::LiveCurrentVersion,
+                    "版本自身的规范化哈希应能解释该网站结论"
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+            writer.join().expect("写入线程不应 panic");
+
+            // 前置条件：本次确实在两版之间来回切换过。否则上面的断言可能只是
+            // 一直在看同一版，覆盖不到「两次读取之间换版」的窗口。
+            assert!(
+                seen_a && seen_b,
+                "测试应观察到两个版本（甲={seen_a} 乙={seen_b}）；只见到单版本说明夹具没起作用"
+            );
+        });
+    }
+
+    /// A2.4（**确定性**）：对任意一份本地字节，核对结论必须自洽——
+    /// 顶层 `local_body_hash`、状态里的 `local_body_hash`、以及能解释网站结论的
+    /// `local_site_hash`，三者必须同源于**同一份字节**。
+    ///
+    /// 变异验证：让 `outcome_from_local_bytes` 只接收哈希而不接收字节（即改回
+    /// 「先读一次算哈希、再读一次算网站哈希」的形状）后，本用例立刻变红——
+    /// 因为那时无法再保证两者来自同一份内容。这条不变量之所以能被稳定断言，
+    /// 正是因为实现被做成了「一份字节 → 一条结论」的纯函数；
+    /// 靠并发赛跑去撞微秒级窗口是概率性的，实测改回两次读盘后并发用例照样通过。
+    #[test]
+    fn outcome_is_self_consistent_for_any_local_bytes() {
+        let first = "---\ntitle: \"甲\"\ndraft: false\n---\n\n甲版正文\n".as_bytes().to_vec();
+        let second = "---\ntitle: \"乙\"\ndraft: true\n---\n\n乙版正文，长度不同\n".as_bytes().to_vec();
+        let first_text = String::from_utf8(first.clone()).unwrap();
+
+        // 两版远端快照：main 上有内容且已确认部署，使网站结论真的依赖本地内容。
+        let head = "c1".to_string();
+        let snapshot = RemoteSnapshot {
+            writing: crate::model::BranchCheck::unverified("不参与本断言"),
+            main: crate::model::BranchCheck::present(
+                Some(head.clone()),
+                1,
+                util::hash_bytes(&first),
+                Some(crate::workspace::site_hash_of(&first_text)),
+                Some(true),
+                None,
+            ),
+            deployed_commit: Some(head),
+            ..Default::default()
+        };
+
+        for raw in [&first, &second] {
+            let outcome = outcome_from_local_bytes("self-consistent".to_string(), raw, snapshot.clone());
+            let text = String::from_utf8_lossy(raw).into_owned();
+
+            assert_eq!(
+                outcome.local_body_hash,
+                util::hash_bytes(raw),
+                "顶层哈希必须是该份字节的原文哈希"
+            );
+            assert_eq!(
+                outcome.status.local_body_hash, outcome.local_body_hash,
+                "状态里的本地哈希必须与顶层同源"
+            );
+            // 网站结论必须能被这一份字节的规范化哈希解释：只有同源时才可能成立。
+            let expected = if crate::workspace::site_hash_of(&text)
+                == snapshot.main.site_hash.clone().unwrap_or_default()
+            {
+                crate::model::SiteState::LiveCurrentVersion
+            } else {
+                crate::model::SiteState::LiveOldVersion
+            };
+            assert_eq!(
+                outcome.status.site, expected,
+                "网站结论必须与该份字节的规范化哈希一致，而不是来自另一份内容"
+            );
+        }
+
+        // 两版必须给出**不同**结论，否则本用例证明不了「结论跟随内容」。
+        let a = outcome_from_local_bytes("x".to_string(), &first, snapshot.clone());
+        let b = outcome_from_local_bytes("x".to_string(), &second, snapshot);
+        assert_ne!(a.local_body_hash, b.local_body_hash);
+        assert_ne!(
+            a.status.site, b.status.site,
+            "两版内容的网站结论应当不同，否则断言没有区分力"
+        );
+    }
+
+    /// A2.4：较旧的核对结论在较新内容落盘后不得被当成当前结论写入缓存。
+    ///
+    /// 缓存按「远端头」失效，而列表状态要求「核对结论所依据的本地内容版本」也
+    /// 必须对得上；核对结束后重新读取列表时，状态必须基于**当前**磁盘内容推导，
+    /// 不能因为缓存里有一条结论就宣称已同步。
+    #[test]
+    fn older_remote_conclusion_never_labels_newer_local_content_as_synced() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "race-old".to_string(), meta("旧结论"), "已同步的正文\n".to_string())
+            .unwrap();
+        sync_article(&state, "race-old".to_string(), false).unwrap();
+
+        // 核对一次：写作分支上存在且与本地一致 → 已同步。
+        let synced = check_article_remote(&state, "race-old".to_string()).unwrap();
+        assert_eq!(synced.status.remote_sync, crate::model::RemoteSync::Saved);
+
+        // 本地改动后，旧结论依据的内容版本已经过期。
+        save_article(
+            &state,
+            "race-old".to_string(),
+            meta("旧结论"),
+            "还没同步的新正文\n".to_string(),
+            None,
+        )
+        .unwrap();
+
+        // 列表状态基于当前磁盘内容与仍有效的缓存推导：不得显示「已同步」。
+        let listed = list_articles(&state).unwrap();
+        let entry = listed.iter().find(|a| a.id == "race-old").unwrap();
+        assert_ne!(
+            entry.status.remote_sync,
+            crate::model::RemoteSync::Saved,
+            "本地内容已变时不得沿用旧的「已同步」结论：{entry:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------- A6 预览依赖
+
+    /// A6：`start_site_preview` 在缺依赖时返回可操作的「需准备依赖」错误，
+    /// **不安装**任何东西，也不留下「后台正在安装」的假状态。
+    ///
+    /// 变异验证：让启动路径改回 `pnpm install`（或让 `require_dependencies`
+    /// 安装依赖）后，本用例会因拿不到 `PreviewDependenciesMissing` 而变红。
+    #[test]
+    fn site_preview_without_dependencies_reports_actionable_state_and_does_not_install() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "deps-a".to_string(), meta("预览依赖"), "正文\n".to_string())
+            .unwrap();
+
+        // 夹具工作区没有 node_modules。
+        assert!(!env.path().join("node_modules").exists());
+
+        let err = start_site_preview(&state, "deps-a".to_string(), true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PreviewDependenciesMissing, "{err:?}");
+        assert!(
+            err.message.contains("准备"),
+            "错误信息必须给出下一步动作：{}",
+            err.message
+        );
+
+        // 启动失败的事实与依赖状态一致：没有任务，也没装出依赖。
+        let status = preview_dependency_status(&state);
+        assert_eq!(status, PreviewDependencyStatus::Missing, "不得谎报有准备任务：{status:?}");
+        assert!(!env.path().join("node_modules").exists(), "启动预览不得安装依赖");
+    }
+
+    /// A6：已有一个准备任务在跑时，再次请求准备必须复用同一个任务（同一
+    /// `task_id`），不会重复安装。
+    ///
+    /// 用一个被测试钉住的任务占住槽位，避免依赖真实 `pnpm install` 的时长；
+    /// 断言命令层走的是「复用」分支而不是「再登记一个任务」。
+    #[test]
+    fn repeated_dependency_prepare_requests_deduplicate() {
+        use std::sync::mpsc;
+
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "deps-b".to_string(), meta("依赖去重"), "正文\n".to_string())
+            .unwrap();
+
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = state.preview_dependencies.start({
+            let runs = std::sync::Arc::clone(&runs);
+            move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            }
+        });
+        let task_id = match &first {
+            PreviewDependencyStatus::Preparing { task_id, .. } => task_id.clone(),
+            other => panic!("登记后应是进行中：{other:?}"),
+        };
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("任务应开始运行");
+
+        // 再次请求：必须复用同一任务，不得再登记一个。
+        let second = prepare_site_preview_dependencies(&state).unwrap();
+        assert_eq!(
+            second.task_id(),
+            Some(task_id.as_str()),
+            "重复请求必须复用同一任务：{second:?}"
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "不得重复安装");
+
+        // 状态查询与登记的任务一致。
+        let queried = preview_dependency_status(&state);
+        assert_eq!(queried.task_id(), Some(task_id.as_str()));
+
+        let _ = release_tx.send(());
+    }
+
+    /// A6：工作区没有可复用依赖时，`preview_dependency_status` 是明确的
+    /// 「需准备」，而不是含混的「未知」。
+    #[test]
+    fn dependency_status_is_missing_before_any_preparation() {
+        let env = TestEnv::new();
+        let state = state_for(&env);
+        create_article(&state, "deps-c".to_string(), meta("依赖状态"), "正文\n".to_string())
+            .unwrap();
+        assert_eq!(preview_dependency_status(&state), PreviewDependencyStatus::Missing);
     }
 }

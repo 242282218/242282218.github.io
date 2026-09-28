@@ -37,6 +37,11 @@ pub mod workspace;
 /// 与安装包的核心功能可用。自检**不接触**用户配置的真实仓库，也不访问网络。
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 诊断子命令需要可见的 stdout/stderr：release 是 GUI 子系统，没有控制台，
+    // 必须先接回父终端（且必须早于任何输出）。无参数即正常启动界面，不需要。
+    if !args.is_empty() {
+        crate::util::attach_parent_console();
+    }
     if args.iter().any(|arg| arg == "--self-test") {
         let report = selftest::run();
         if args.iter().any(|arg| arg == "--json") {
@@ -47,6 +52,10 @@ pub fn run() {
         } else {
             print!("{}", selftest::render_human(&report));
         }
+        // 接回终端后 stdout 可能仍是行缓冲；显式冲刷避免退出时丢最后一段输出。
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
         std::process::exit(if report.ok { 0 } else { 1 });
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -136,9 +145,11 @@ pub fn run() {
             ipc::toolchain_report,
             ipc::list_articles,
             ipc::read_article,
+            ipc::check_article_remote,
             ipc::create_article,
             ipc::save_article,
             ipc::import_article,
+            ipc::export_article,
             ipc::import_article_image,
             ipc::import_article_image_bytes,
             ipc::list_article_images,
@@ -166,6 +177,8 @@ pub fn run() {
             ipc::set_preferences,
             ipc::start_site_preview,
             ipc::stop_site_preview,
+            ipc::preview_dependency_status,
+            ipc::prepare_preview_dependencies,
             ipc::deployment_status,
             ipc::status_overview,
         ])

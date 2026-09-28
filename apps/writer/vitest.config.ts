@@ -12,7 +12,8 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     include: ['src/tests/**/*.test.ts'],
-    // Vditor 依赖真实 DOM 测量，给出更宽的等待时间。
+    // 补齐 jsdom 缺失的浏览器 API（Range 测量等），见 setup.ts 的说明。
+    setupFiles: ['src/tests/setup.ts'],
     testTimeout: 30000,
   },
 })

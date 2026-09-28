@@ -43,6 +43,18 @@ pub struct WritingPreferences {
     pub editor_mode: String,
     /// 自动保存停顿防抖（毫秒）。
     pub auto_save_debounce_ms: u16,
+    /// 外壳配色：`system`（默认，跟随系统）/ `light` / `dark`。
+    ///
+    /// 只作用于软件外壳；站点预览始终浅色（网站只有 light 主题）。
+    /// `serde(default)` 不可省略：旧版 `config.json` 没有这个字段，缺失时
+    /// 反序列化失败会让整份配置被判为损坏并重置，用户的其他偏好一并丢失。
+    #[serde(default = "default_shell_theme")]
+    pub shell_theme: String,
+}
+
+/// 外壳配色的默认值：跟随系统。
+fn default_shell_theme() -> String {
+    "system".to_string()
 }
 
 impl Default for WritingPreferences {
@@ -54,6 +66,7 @@ impl Default for WritingPreferences {
             preview_width: 460,
             editor_mode: "sv".to_string(),
             auto_save_debounce_ms: 800,
+            shell_theme: default_shell_theme(),
         }
     }
 }
@@ -70,6 +83,10 @@ impl WritingPreferences {
         }
         if self.code_theme.trim().is_empty() {
             self.code_theme = "github".to_string();
+        }
+        // 未知取值退回「跟随系统」，而不是留一个没有消费者的字符串。
+        if !matches!(self.shell_theme.as_str(), "system" | "light" | "dark") {
+            self.shell_theme = default_shell_theme();
         }
     }
 }
@@ -177,6 +194,64 @@ pub struct VersionIndex {
     pub schema_version: u32,
     #[serde(default)]
     pub articles: BTreeMap<String, ArticleBaseline>,
+}
+
+/// 远端核对缓存中的一条记录。
+///
+/// 缓存**只**用于省掉重复的远端读取，不能替代事实：只有先成功取得当前远端头，
+/// 且头与 `head` 一致时才允许复用。因此每条记录都必须带上它成立时的头提交。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCheckEntry {
+    /// 两个分支各自的核对结论。`head` 为该条记录成立时的远端头。
+    pub writing: crate::model::BranchCheck,
+    pub main: crate::model::BranchCheck,
+    /// 仓库标识（远端 URL 归一化后的值），换仓库后缓存立即失效。
+    pub repo: String,
+}
+
+/// 远端核对缓存：以「仓库 ＋ 分支 ＋ 文章路径」为键。
+///
+/// 键里不含头提交：头是**复用条件**（`RemoteCheckEntry` 内记录），
+/// 而不是键的一部分——同一篇文章在不同头下的结论需要互相覆盖，
+/// 而不是无限堆积。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCheckCache {
+    pub schema_version: u32,
+    /// 键为 `repo::article_id`，值为该文章两分支的最近一次结论。
+    #[serde(default)]
+    pub entries: BTreeMap<String, RemoteCheckEntry>,
+}
+
+impl RemoteCheckCache {
+    /// 缓存键：仓库 ＋ 文章。分支在值内部区分。
+    pub fn key(repo: &str, article_id: &str) -> String {
+        format!("{repo}::{article_id}")
+    }
+
+    fn load_or_default(path: &Path) -> Self {
+        let empty = || Self { schema_version: SCHEMA_VERSION, entries: BTreeMap::new() };
+        let Ok(bytes) = fs::read(path) else {
+            return empty();
+        };
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(mut cache) => {
+                cache.schema_version = SCHEMA_VERSION;
+                cache
+            }
+            // 缓存是可重建的派生数据：损坏时直接丢弃，不留档也不报错。
+            Err(_) => empty(),
+        }
+    }
+
+    pub fn get(&self, repo: &str, article_id: &str) -> Option<&RemoteCheckEntry> {
+        self.entries.get(&Self::key(repo, article_id))
+    }
+
+    pub fn put(&mut self, repo: &str, article_id: &str, entry: RemoteCheckEntry) {
+        self.entries.insert(Self::key(repo, article_id), entry);
+    }
 }
 
 impl VersionIndex {
@@ -390,6 +465,53 @@ impl LocalStore {
 
     fn versions_path(&self) -> PathBuf {
         self.root.join("versions.json")
+    }
+
+    /// 远端核对缓存文件。可随时删除：删除只失去缓存，不改变任何结论。
+    fn remote_checks_path(&self) -> PathBuf {
+        self.root.join("remote-checks.json")
+    }
+
+    /// 环境检查结果文件（含检查时间戳）。缺失即「尚未检查」。
+    fn toolchain_path(&self) -> PathBuf {
+        self.root.join("toolchain.json")
+    }
+
+    /// 读取上次的环境检查结果。
+    ///
+    /// 文件缺失或损坏时返回「尚未检查」——**不**退化成默认报告，
+    /// 否则界面会把「没查过」显示成「环境齐备」。
+    pub fn load_toolchain_state(&self) -> crate::preview::ToolchainState {
+        let Ok(bytes) = fs::read(self.toolchain_path()) else {
+            return crate::preview::ToolchainState::Unchecked;
+        };
+        serde_json::from_slice::<crate::preview::ToolchainState>(&bytes)
+            .unwrap_or(crate::preview::ToolchainState::Unchecked)
+    }
+
+    /// 记录一次环境检查结果。
+    pub fn save_toolchain_state(&self, state: &crate::preview::ToolchainState) -> Result<()> {
+        let text = serde_json::to_string_pretty(state).map_err(|e| {
+            WriterError::new(ErrorCode::IoFailed, format!("无法序列化环境检查结果：{e}"))
+        })?;
+        fs::write(self.toolchain_path(), text).map_err(|e| {
+            WriterError::new(ErrorCode::IoFailed, format!("无法写入环境检查结果：{e}"))
+        })
+    }
+
+    /// 读取远端核对缓存；文件缺失或损坏时返回空缓存。
+    pub fn load_remote_checks(&self) -> RemoteCheckCache {
+        RemoteCheckCache::load_or_default(&self.remote_checks_path())
+    }
+
+    /// 写入远端核对缓存。
+    pub fn save_remote_checks(&self, cache: &RemoteCheckCache) -> Result<()> {
+        let text = serde_json::to_string_pretty(cache).map_err(|e| {
+            WriterError::new(ErrorCode::IoFailed, format!("无法序列化远端核对缓存：{e}"))
+        })?;
+        fs::write(self.remote_checks_path(), text).map_err(|e| {
+            WriterError::new(ErrorCode::IoFailed, format!("无法写入远端核对缓存：{e}"))
+        })
     }
 
     fn trash_index_path(&self) -> PathBuf {

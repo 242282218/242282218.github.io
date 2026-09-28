@@ -184,7 +184,7 @@ impl TestEnv {
 
     fn show_at(&self, repo: &Path, spec: &str) -> Option<String> {
         let envs = self.envs();
-        let out = std::process::Command::new("git")
+        let out = crate::util::program_command("git")
             .current_dir(repo)
             .envs(envs.iter().map(|(k, v)| (*k, v.clone())))
             .args(["-c", "core.quotePath=false", "show", spec])
@@ -200,7 +200,7 @@ impl TestEnv {
     /// 列出 bare 远端某分支上受管目录中的文件。
     pub fn remote_ls(&self, branch: &str, dir: &str) -> Vec<String> {
         let envs = self.envs();
-        let out = std::process::Command::new("git")
+        let out = crate::util::program_command("git")
             .current_dir(&self.remote)
             .envs(envs.iter().map(|(k, v)| (*k, v.clone())))
             .args(["-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only", branch, "--", dir])

@@ -24,7 +24,8 @@ pub struct ConnectionStatus {
     pub connected: bool,
     /// 工作目录是否真实存在且是 Git 仓库。
     pub workspace_ready: bool,
-    pub toolchain: crate::preview::ToolchainReport,
+    /// 环境检查状态：启动时通常是「尚未检查」，不阻塞首帧、不派生探测进程。
+    pub toolchain: crate::preview::ToolchainState,
     /// 必须让用户确认的公开性说明。
     pub public_disclosure: String,
     /// 是否已向用户说明「公开仓库会公开远程草稿」。
@@ -48,6 +49,11 @@ impl Connector {
     }
 
     /// 读取当前的连接状态。
+    ///
+    /// **本函数不启动任何外部进程**：环境（Git / Node / pnpm）由
+    /// [`Self::toolchain_state`] 单独读取上次的检查结果，真实探测由用户显式
+    /// 触发（见 [`Self::run_toolchain_check`]）。旧实现在这里同步执行三个
+    /// 探测命令，既是启动黑窗的来源，也让首帧等待进程创建。
     pub fn status(&self) -> ConnectionStatus {
         let config = self.store.load_config();
         let workspace_ready = !config.workspace_dir.is_empty()
@@ -58,11 +64,22 @@ impl Connector {
             workspace_dir: config.workspace_dir.clone(),
             connected: config.connected && workspace_ready,
             workspace_ready,
-            toolchain: crate::preview::check_toolchain(),
+            toolchain: self.toolchain_state(),
             public_disclosure: PUBLIC_DISCLOSURE.to_string(),
             disclosed_public_drafts: config.disclosed_public_drafts,
             blocking_issue: None,
         }
+    }
+
+    /// 读取上次环境检查的结果（不执行探测）。
+    pub fn toolchain_state(&self) -> crate::preview::ToolchainState {
+        self.store.load_toolchain_state()
+    }
+
+    /// 执行一次真实的环境检查并落盘结果（联网/进程创建都发生在这里）。
+    pub fn run_toolchain_check(&self) -> Result<crate::preview::ToolchainState> {
+        let state = crate::preview::run_toolchain_check(&self.store);
+        Ok(state)
     }
 
     /// 确认已向用户说明公开仓库的草稿可见性。
@@ -81,7 +98,8 @@ impl Connector {
     ///
     /// - 目标仓库固定为配置中的公开仓库，不接受任意路径输入；
     /// - 不使用开发者手头的 repo；
-    /// - 离线时可指向一个已存在的工作目录继续使用（`adopt_existing`）。
+    /// - 已存在的 Git 仓库只有当它位于**应用数据目录内**（即软件自己 clone 的
+    ///   工作副本）才会被采用；其余位置只能交给软件新建（即空目录）。
     pub fn connect(&self, workspace_dir: Option<PathBuf>) -> Result<ConnectionStatus> {
         let mut config = self.store.load_config();
         if !config.disclosed_public_drafts {
@@ -115,13 +133,26 @@ impl Connector {
                 )
                 .with_detail(git::redact_credentials(out.stdout_trimmed())));
             }
-            // 关键防护：绝不把**开发者手头的 checkout** 当成工作区。
-            // 否则同步/发布/删除会直接作用在该目录上（推真实远端、删真实文件）。
-            // 应用数据目录内的目录是自己的 clone，不受此限制。
-            if !is_inside_app_data(&self.store, &target) && looks_like_development_checkout(&target) {
+            // 关键防护：绝不把**开发者手头的仓库**当成工作区。
+            //
+            // 仅校验 origin 不够：同一仓库的个人 clone、以及 `.git` 指向别处的
+            // linked worktree，origin 都与目标仓库一致，但它们的工作树属于用户
+            // 自己的开发环境。软件随后会在那里同步、发布、删除——直接推真实远端、
+            // 删真实文件，与「在应用数据目录里建独立 clone」的承诺相反。
+            //
+            // 因此判据不是「像不像开发目录」，而是「是不是软件自己建的」：只有
+            // 应用数据目录内的仓库被采用，其余位置一律要求交给软件新建。
+            if !is_inside_app_data(&self.store, &target) {
+                let hint = if looks_like_development_checkout(&target) {
+                    "该目录看起来是本项目的开发检出目录"
+                } else {
+                    "该目录是已存在的 Git 仓库，但不是软件建立的工作副本"
+                };
                 return Err(WriterError::new(
                     ErrorCode::InvalidArgument,
-                    "该目录看起来是本项目的开发检出目录，软件不会把它当作工作区；请改用应用数据目录下的独立工作目录",
+                    format!(
+                        "{hint}，软件不会把它当作工作区；请改用一个空目录，由软件创建独立工作副本"
+                    ),
                 )
                 .with_detail(target.to_string_lossy().to_string()));
             }
@@ -374,6 +405,79 @@ mod tests {
 
         // 应用数据目录内的目录不受此限制。
         assert!(is_inside_app_data(&store, &store.root().join("workspace")));
+    }
+
+    /// P1 回归：**同源但没有开发标记**的既有仓库同样不得被当成工作区。
+    ///
+    /// 判据是「是不是软件自己建的」，不是「像不像开发目录」：个人 clone 与
+    /// linked worktree 的 origin 都与目标仓库一致，但工作树属于用户的开发环境，
+    /// 软件在其中同步/发布/删除会直接推真实远端、删真实文件。
+    #[test]
+    fn refuses_same_origin_checkout_outside_app_data() {
+        let (dir, store) = store();
+        let connector = Connector::new(store.clone_handle());
+        connector.acknowledge_disclosure().unwrap();
+
+        // 一个普通的同源 clone：没有任何开发目录标记。
+        let clone = dir.path().join("plain-clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        git::git(&clone, &["init", "--initial-branch=main"]).unwrap();
+        let config = store.load_config();
+        git::git(&clone, &["remote", "add", "origin", &config.repo_url]).unwrap();
+        assert!(!looks_like_development_checkout(&clone), "夹具不应带开发标记");
+
+        let err = connector.connect(Some(clone)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("工作区"), "{}", err.message);
+
+        // linked worktree：`.git` 是指向别处的文件，同样不得被采用。
+        let main_repo = dir.path().join("main-repo");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git::git(&main_repo, &["init", "--initial-branch=main"]).unwrap();
+        git::git(&main_repo, &["remote", "add", "origin", &config.repo_url]).unwrap();
+        // 临时仓库没有配置身份，显式带上，避免 commit 依赖全局 git config。
+        git::git(
+            &main_repo,
+            &[
+                "-c",
+                "user.name=测试",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        let linked = dir.path().join("linked-worktree");
+        git::git(
+            &main_repo,
+            &["worktree", "add", "-b", "side", &linked.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(linked.join(".git").is_file(), "worktree 的 .git 应是文件");
+
+        let err = connector.connect(Some(linked)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// 应用数据目录内的既有仓库仍被采用（软件自己的 clone 不受上面两条限制）。
+    #[test]
+    fn adopts_existing_repository_inside_app_data() {
+        let (_dir, store) = store();
+        let connector = Connector::new(store.clone_handle());
+        connector.acknowledge_disclosure().unwrap();
+
+        let workspace = connector.default_workspace_dir();
+        std::fs::create_dir_all(&workspace).unwrap();
+        git::git(&workspace, &["init", "--initial-branch=main"]).unwrap();
+        let config = store.load_config();
+        git::git(&workspace, &["remote", "add", "origin", &config.repo_url]).unwrap();
+
+        let status = connector.connect(Some(workspace)).unwrap();
+        assert!(status.connected);
+        assert!(status.workspace_ready);
     }
 
     /// P1 回归：仓库地址必须是受支持的 Git 远端，而不是任意本机路径。

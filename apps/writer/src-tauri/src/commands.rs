@@ -224,6 +224,7 @@ pub fn summarize_counts(
     let mut out = HashMap::new();
     for (sync, site) in statuses {
         *out.entry(match sync {
+            crate::model::RemoteSync::Unverified => "待核对",
             crate::model::RemoteSync::LocalOnly => "仅本地",
             crate::model::RemoteSync::Saving => "同步中",
             crate::model::RemoteSync::Saved => "远程已存",
@@ -232,6 +233,7 @@ pub fn summarize_counts(
         })
         .or_insert(0) += 1;
         *out.entry(match site {
+            crate::model::SiteState::Unverified => "待核对",
             crate::model::SiteState::NeverPublished => "从未发布",
             crate::model::SiteState::LiveOldVersion => "网站仍是旧版",
             crate::model::SiteState::PublicationSubmitted => "已提交发布",

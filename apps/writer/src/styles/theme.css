@@ -1,0 +1,103 @@
+/**
+ * Tailwind v4 主题入口。
+ *
+ * 把 `tokens.css` 的观澜志色板映射为 Tailwind 的 `@theme` 变量，并补齐
+ * 控件尺寸与圆角。**只用于软件自身外壳**：站点预览另有一份从
+ * `src/styles/global.css` 生成的受控快照，两者不要混用。
+ *
+ * 颜色遵循 `AGENTS.md` 的视觉约定（近白底、深蓝黑文字、蓝色强调），
+ * 不采用参考实现的中性黑白配色。
+ */
+@import 'tailwindcss';
+
+/*
+ * 只扫描 writer 自己的源码：站点源码在仓库另一处，且本软件对站点只读，
+ * Tailwind 不应因站点文件变化而改变软件界面产物。
+ */
+@source '../**/*.{vue,ts}';
+
+@theme {
+  /* 底色与层次 */
+  --color-gl-bg: #fbfbfd;
+  --color-gl-surface: #ffffff;
+  --color-gl-surface-muted: #f3f5f9;
+  --color-gl-border: #dde2ea;
+  --color-gl-border-strong: #c3cbd8;
+
+  /* 深蓝黑文字 */
+  --color-gl-text: #131a26;
+  --color-gl-text-muted: #4d5768;
+  --color-gl-text-subtle: #6b7688;
+
+  /* 蓝色强调（观澜志蓝） */
+  --color-gl-accent: #1b4fd8;
+  --color-gl-accent-hover: #1740ad;
+  --color-gl-accent-soft: #e8eefc;
+
+  /* 状态色：颜色只是辅助，界面上必须同时有文字 */
+  --color-gl-ok: #1f6f43;
+  --color-gl-ok-soft: #e6f4ec;
+  --color-gl-warn: #8a5a00;
+  --color-gl-warn-soft: #fdf3e0;
+  --color-gl-danger: #a4232b;
+  --color-gl-danger-soft: #fdeced;
+
+  /* 尺寸节奏：4px 基准 */
+  --spacing: 0.25rem;
+  /* 控件高度 40 / 36 / 28px，对应菜单栏与工具栏的层次 */
+  --spacing-gl-control: 40px;
+  --spacing-gl-control-sm: 36px;
+  --spacing-gl-control-xs: 28px;
+  /* 头栏高度，照搬参考实现的 60px */
+  --spacing-gl-header: 60px;
+  /* 状态栏高度 */
+  --spacing-gl-statusbar: 24px;
+
+  /* 圆角 6 / 8 / 12px */
+  --radius-gl-sm: 6px;
+  --radius-gl: 8px;
+  --radius-gl-lg: 12px;
+
+  /* 字号 12 / 14 / 16 / 18px */
+  --text-gl-xs: 12px;
+  --text-gl-sm: 14px;
+  --text-gl-base: 16px;
+  --text-gl-lg: 18px;
+
+  --font-gl-ui: 'Segoe UI', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  --font-gl-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+
+  --shadow-gl: 0 1px 2px rgb(19 26 38 / 0.06);
+  --shadow-gl-lg: 0 6px 24px rgb(19 26 38 / 0.12);
+}
+
+/*
+ * 外壳深色模式（§3.5-4）。
+ *
+ * 只作用于软件外壳；站点预览容器始终保持浅色——网站只有 light 主题，
+ * 让预览跟着变黑会得到一个网站上不存在的观感。
+ */
+@layer base {
+  :root.dark {
+    --color-gl-bg: #12161f;
+    --color-gl-surface: #1a1f2b;
+    --color-gl-surface-muted: #212734;
+    --color-gl-border: #2c3444;
+    --color-gl-border-strong: #3d4759;
+
+    --color-gl-text: #e8ecf3;
+    --color-gl-text-muted: #a8b3c4;
+    --color-gl-text-subtle: #8492a6;
+
+    --color-gl-accent: #6f9dff;
+    --color-gl-accent-hover: #8db2ff;
+    --color-gl-accent-soft: #1e2a44;
+
+    --color-gl-ok: #6fd39a;
+    --color-gl-ok-soft: #14291f;
+    --color-gl-warn: #e0b055;
+    --color-gl-warn-soft: #2b2312;
+    --color-gl-danger: #f08a90;
+    --color-gl-danger-soft: #2e1518;
+  }
+}

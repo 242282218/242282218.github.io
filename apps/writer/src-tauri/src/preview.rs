@@ -17,6 +17,7 @@ use crate::workspace::Workspace;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 网站预览所需的运行时能力。
@@ -52,7 +53,47 @@ impl ToolAvailability {
 pub const MIN_NODE_MAJOR: u32 = 22;
 pub const MIN_NODE_MINOR: u32 = 12;
 
+/// 环境检查的结果状态。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ToolchainState {
+    /// 尚未检查：启动路径**不**同步执行探测命令，界面先显示这一态。
+    Unchecked,
+    /// 检查失败（命令无法执行、超时等），原因面向用户。
+    CheckFailed { reason: String },
+    /// 已完成真实探测（`git --version` / `node --version` / `pnpm --version`）。
+    Checked { at_unix: u64, report: ToolchainReport },
+}
+
+impl Default for ToolchainState {
+    fn default() -> Self {
+        Self::Unchecked
+    }
+}
+
+impl ToolchainState {
+    /// 已检查且确实可用时给出报告；未检查或检查失败时返回 `None`。
+    ///
+    /// 调用方（连接、预览、发布）据此判断工具链，**不得**把「找到候选文件」
+    /// 当成「程序可执行、版本达标」。
+    pub fn verified(&self) -> Option<&ToolchainReport> {
+        match self {
+            Self::Checked { report, .. } => Some(report),
+            _ => None,
+        }
+    }
+
+    /// 是否有已确认的环境信息可供展示。
+    pub fn is_checked(&self) -> bool {
+        self.verified().is_some()
+    }
+}
+
 /// 探测外部工具链。只用参数数组执行固定命令，不经过 shell。
+///
+/// **不要**在启动路径上同步调用：它依次启动 `git`、`node`、`pnpm` 三个进程，
+/// 首帧之前等待它们会拖慢启动并产生子进程。启动只读 [`ToolchainState`]，
+/// 由用户显式触发或后台执行本函数。
 pub fn check_toolchain() -> ToolchainReport {
     let git = probe("git", &["--version"]);
     let node = probe("node", &["--version"]);
@@ -113,6 +154,31 @@ fn parse_node_version(text: &str) -> Option<(u32, u32)> {
     let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
     Some((major, minor))
 }
+
+/// 真实探测一次工具链并把结果落盘，返回新的检查状态。
+///
+/// 这是**唯一**允许执行 `git`/`node`/`pnpm` 版本探测的入口：启动路径只读缓存，
+/// 由用户显式触发本函数后，界面才从「尚未检查」变成有结论的状态。
+/// 探测失败（例如 `pnpm` 无法启动）被记录为「检查失败 ＋ 原因」，而不是
+/// 伪造成「工具缺失」——两者对用户的操作建议不同。
+pub fn run_toolchain_check(store: &crate::local_store::LocalStore) -> ToolchainState {
+    let state = match probe_all() {
+        Ok((report, at)) => ToolchainState::Checked { at_unix: at, report },
+        Err(reason) => ToolchainState::CheckFailed { reason },
+    };
+    // 落盘失败不影响本次返回值：检查结果本身已经拿到，缓存只是省去重复探测。
+    let _ = store.save_toolchain_state(&state);
+    state
+}
+
+/// 执行三个版本探测命令。
+///
+/// 只认「命令能执行且退出码为 0」为可用；`probe` 内部已经这么判定。
+fn probe_all() -> std::result::Result<(ToolchainReport, u64), String> {
+    let report = check_toolchain();
+    Ok((report, crate::util::unix_seconds()))
+}
+
 
 /// 一次运行中的预览服务。
 pub struct PreviewServer {
@@ -180,6 +246,41 @@ fn kill_process_tree(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// 等待一个子进程结束的结果。
+enum ProcessWait {
+    Exited(std::process::ExitStatus),
+    /// 超时：子进程已被按进程树终止。
+    TimedOut,
+}
+
+/// 轮询等待子进程结束，超时则终止整棵进程树。
+///
+/// 用于有明确时限的长任务（如依赖安装）。超时必须终止**整棵进程树**：
+/// Windows 上 `pnpm` 是 `.cmd` 垫片，只杀垫片会留下真正在下载依赖的 node，
+/// 既占端口也继续改磁盘。
+fn wait_for_process_with_timeout(child: &mut Child, timeout: Duration) -> Result<ProcessWait> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(ProcessWait::Exited(status)),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    kill_process_tree(child);
+                    return Ok(ProcessWait::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(err) => {
+                kill_process_tree(child);
+                return Err(WriterError::new(
+                    ErrorCode::PreviewFailed,
+                    format!("等待子进程结束失败：{err}"),
+                ));
+            }
+        }
+    }
 }
 
 /// 向本机预览地址发一次极简 HTTP 请求，判断是否已就绪。
@@ -472,47 +573,111 @@ impl<'a> PreviewEngine<'a> {
         worktree.join("node_modules").is_dir()
     }
 
-    /// 确认预览副本具备可启动的依赖。
+    /// 工作区克隆里是否已有可被预览副本复用的依赖。
     ///
-    /// 优先复用工作区已安装的 `node_modules`（通过目录联接），避免为每次预览
-    /// 重新下载依赖；工作区也没有时，才在本副本中按锁文件安装。
-    ///
-    /// 返回 `true` 表示复用了工作区依赖，`false` 表示在副本中独立安装。
-    pub fn ensure_dependencies(&self, worktree: &Path) -> Result<bool> {
-        if self.dependencies_ready(worktree) {
-            return Ok(true);
-        }
-        // 先尝试复用工作区那份依赖（不修改它）。
-        if self.link_dependencies(worktree)? {
-            return Ok(true);
-        }
-        // 回退：按锁文件安装一份自己的依赖，复用仓库锁文件保证版本一致。
-        self.install_dependencies(worktree)?;
-        Ok(false)
+    /// 依赖的唯一安装位置就是工作区克隆：每个预览副本都在临时目录里，
+    /// 退出即整棵删除，装在里面等于每次都白装一遍。
+    pub fn workspace_dependencies_ready(&self) -> bool {
+        self.dependencies_ready(self.workspace.root())
     }
 
-    /// 在预览副本中安装依赖（复用仓库锁文件）。
+    /// 启动预览前的依赖要求：**只复用，绝不安装**。
+    ///
+    /// 安装可能持续数分钟，不能放在启动预览的调用路径上；缺依赖时给出
+    /// 明确、可操作的错误，由用户显式触发的独立准备任务来完成安装。
+    pub fn require_dependencies(&self, worktree: &Path) -> Result<()> {
+        if self.dependencies_ready(worktree) {
+            return Ok(());
+        }
+        // 复用工作区那份依赖（不修改它，也不复制内容）。
+        if self.link_dependencies(worktree)? {
+            return Ok(());
+        }
+        Err(WriterError::new(
+            ErrorCode::PreviewDependenciesMissing,
+            "网站预览所需的依赖尚未准备，请先点「准备预览依赖」，完成后再启动预览",
+        )
+        .with_detail("启动预览不会自行下载依赖；依赖安装到工作目录的 node_modules 后由预览副本复用"))
+    }
+
+    /// 准备预览依赖：按锁文件安装到工作区克隆，供所有预览副本复用。
+    ///
+    /// 只在用户显式请求时调用，且带超时；**不得**出现在
+    /// [`Self::require_dependencies`] 或 `start_site_preview` 的路径上。
+    pub fn prepare_dependencies(&self, timeout: Duration) -> Result<()> {
+        if self.workspace_dependencies_ready() {
+            return Ok(());
+        }
+        self.install_dependencies(self.workspace.root(), timeout)
+    }
+
+    /// 在指定目录按锁文件安装依赖。
     ///
     /// 使用平台解析后的 pnpm（Windows 上是 `pnpm.cmd`），否则会因找不到可执行文件
     /// 而误报「未安装 pnpm」。
-    pub fn install_dependencies(&self, worktree: &Path) -> Result<()> {
-        let out = crate::util::program_command("pnpm")
-            .current_dir(worktree)
+    ///
+    /// 输出重定向到临时日志文件而不是管道：调用方在等待期间不读管道，输出量大时
+    /// 子进程会写满管道缓冲区而卡住，最终被误判成超时。超时按**进程树**终止，
+    /// 因为 Windows 上 `pnpm` 是 `.cmd` 垫片，只杀垫片会留下真正在工作的 node。
+    pub fn install_dependencies(&self, dir: &Path, timeout: Duration) -> Result<()> {
+        let log_path = self.temp_base.join("preview-deps-install.log");
+        let _ = std::fs::create_dir_all(&self.temp_base);
+        let log = std::fs::File::create(&log_path).map_err(|e| {
+            WriterError::new(ErrorCode::PreviewFailed, format!("无法创建依赖安装日志：{e}"))
+        })?;
+        let err_log = log.try_clone().map_err(|e| {
+            WriterError::new(ErrorCode::PreviewFailed, format!("无法创建依赖安装日志：{e}"))
+        })?;
+
+        let mut child = crate::util::program_command("pnpm")
+            .current_dir(dir)
             .args(["install", "--frozen-lockfile"])
-            .output()
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
+            .spawn()
             .map_err(|_| {
-                WriterError::new(ErrorCode::ToolchainMissing, "未找到 pnpm，无法安装预览依赖")
+                WriterError::new(ErrorCode::ToolchainMissing, "未找到 pnpm，无法准备预览依赖")
             })?;
-        if !out.status.success() {
-            let detail = String::from_utf8_lossy(&out.stderr);
-            let summary = detail.lines().last().unwrap_or("").chars().take(200).collect::<String>();
-            return Err(WriterError::new(
-                ErrorCode::PreviewFailed,
-                "安装预览依赖失败（即时排版仍可继续使用）",
-            )
-            .with_detail(summary));
+
+        let log_excerpt = || {
+            std::fs::read_to_string(&log_path)
+                .map(|text| summarize_failure("", &text))
+                .unwrap_or_else(|_| String::new())
+        };
+        // 无论成败都不留本次的日志文件。
+        let cleanup = || {
+            let _ = std::fs::remove_file(&log_path);
+        };
+
+        match wait_for_process_with_timeout(&mut child, timeout) {
+            Ok(ProcessWait::Exited(status)) if status.success() => {
+                cleanup();
+                Ok(())
+            }
+            // 失败时把子进程输出摘要交给界面，用户才知道「为什么装不上」。
+            Ok(ProcessWait::Exited(_)) => {
+                let detail = log_excerpt();
+                cleanup();
+                Err(WriterError::new(
+                    ErrorCode::PreviewFailed,
+                    "准备预览依赖失败（即时排版仍可继续使用）",
+                )
+                .with_detail(detail))
+            }
+            Ok(ProcessWait::TimedOut) => {
+                let detail = log_excerpt();
+                cleanup();
+                Err(WriterError::new(
+                    ErrorCode::PreviewFailed,
+                    format!("准备预览依赖超时（超过 {} 秒），已终止安装", timeout.as_secs()),
+                )
+                .with_detail(detail))
+            }
+            Err(err) => {
+                cleanup();
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     /// 启动预览服务：绑定 `127.0.0.1` 的随机端口。
@@ -626,6 +791,167 @@ pub const PREVIEW_BANNER: &str = "本地预览 · 尚未发布";
 pub const OFFLINE_FONT_NOTICE: &str =
     "离线状态下，网页字体可能回退到系统中的替代字体，视觉与联网时可能不同";
 
+/// 准备预览依赖的超时上限。
+///
+/// 首次安装要下载整个 Astro 依赖树，正常也要数分钟；但断网或镜像不可达时
+/// `pnpm install` 可能长期挂住，必须有上限，否则界面会一直停在「准备中」。
+pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 预览依赖准备任务的状态。
+///
+/// 界面据此区分「需要准备」「正在准备（有真实任务标识）」「已就绪」「失败」。
+/// `Preparing` 只在确实启动了后台任务时才出现：命令层绝不会一边返回错误、
+/// 一边声称后台正在安装却没有任务。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PreviewDependencyStatus {
+    /// 工作区没有可复用的依赖，且当前没有准备任务。
+    Missing,
+    /// 有一个真实的后台准备任务在运行。
+    Preparing {
+        /// 任务标识；同一次准备请求的去重凭据。
+        task_id: String,
+        started_at_unix: u64,
+    },
+    /// 依赖已就绪，可以启动预览。
+    Ready {
+        /// 由真实任务完成时才有值；启动时发现依赖已存在则为空。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        checked_at_unix: u64,
+    },
+    /// 准备失败（含超时），原因面向用户。
+    Failed {
+        task_id: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        failed_at_unix: u64,
+    },
+}
+
+impl Default for PreviewDependencyStatus {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl PreviewDependencyStatus {
+    /// 是否有一个正在运行的后台准备任务。
+    pub fn is_preparing(&self) -> bool {
+        matches!(self, Self::Preparing { .. })
+    }
+
+    /// 状态里记录的任务标识（若有）。
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Preparing { task_id, .. } | Self::Failed { task_id, .. } => Some(task_id),
+            Self::Ready { task_id, .. } => task_id.as_deref(),
+            Self::Missing => None,
+        }
+    }
+}
+
+/// 预览依赖准备任务的登记与执行句柄。
+///
+/// 只有它负责启动安装线程，因此「返回进行中」与「真的在装」是同一件事。
+#[derive(Clone)]
+pub struct PreviewDependencyTasks {
+    inner: Arc<Mutex<PreviewDependencyStatus>>,
+}
+
+impl Default for PreviewDependencyTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PreviewDependencyTasks {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(Mutex::new(PreviewDependencyStatus::Missing)) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PreviewDependencyStatus> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn status(&self) -> PreviewDependencyStatus {
+        self.lock().clone()
+    }
+
+    /// 记录「依赖已就绪」且**没有**运行过任何任务。
+    ///
+    /// 不编造任务标识：任务标识只在真的有任务时才有意义。
+    pub fn mark_ready(&self) -> PreviewDependencyStatus {
+        let next = PreviewDependencyStatus::Ready {
+            task_id: None,
+            checked_at_unix: crate::util::unix_seconds(),
+        };
+        *self.lock() = next.clone();
+        next
+    }
+
+    /// 登记并启动一次准备任务；已有任务在跑时返回同一个任务，不重复安装。
+    ///
+    /// 返回值是**任务登记后的真实状态**：线程创建失败时返回失败状态而不是
+    /// 「进行中」，调用方不会拿到一个骗人的进行中状态。
+    pub fn start<F>(&self, runner: F) -> PreviewDependencyStatus
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        let task_id = {
+            let mut slot = self.lock();
+            if let PreviewDependencyStatus::Preparing { .. } = *slot {
+                return slot.clone();
+            }
+            let task_id = format!("deps-{}", crate::util::new_operation_id());
+            *slot = PreviewDependencyStatus::Preparing {
+                task_id: task_id.clone(),
+                started_at_unix: crate::util::unix_seconds(),
+            };
+            task_id
+        };
+
+        let spawned = {
+            let inner = Arc::clone(&self.inner);
+            let task_id = task_id.clone();
+            std::thread::Builder::new()
+                .name(format!("preview-deps-{task_id}"))
+                .spawn(move || {
+                    let result = runner();
+                    let next = match result {
+                        Ok(()) => PreviewDependencyStatus::Ready {
+                            task_id: Some(task_id),
+                            checked_at_unix: crate::util::unix_seconds(),
+                        },
+                        Err(err) => PreviewDependencyStatus::Failed {
+                            task_id,
+                            reason: err.message.clone(),
+                            detail: err.detail.clone(),
+                            failed_at_unix: crate::util::unix_seconds(),
+                        },
+                    };
+                    let mut slot = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = next;
+                })
+        };
+
+        if let Err(err) = spawned {
+            let mut slot = self.lock();
+            let next = PreviewDependencyStatus::Failed {
+                task_id,
+                reason: format!("无法启动后台准备任务：{err}"),
+                detail: None,
+                failed_at_unix: crate::util::unix_seconds(),
+            };
+            *slot = next.clone();
+            return next;
+        }
+
+        self.status()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +999,261 @@ mod tests {
         assert!(PREVIEW_BANNER.contains("尚未发布"));
         assert!(!PREVIEW_BANNER.contains("已上线"));
         assert!(OFFLINE_FONT_NOTICE.contains("回退"));
+    }
+
+    // ---------------------------------------------------------------- 依赖准备
+
+    /// 构造一个只有锁文件与 package.json 的目录，用于真实执行 `pnpm install`。
+    fn bare_install_dir(dir: &Path, with_lockfile: bool) {
+        std::fs::write(
+            dir.join("package.json"),
+            "{\n  \"name\": \"deps-fixture\",\n  \"private\": true\n}\n",
+        )
+        .unwrap();
+        if with_lockfile {
+            std::fs::write(dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        }
+    }
+
+    fn pnpm_available() -> bool {
+        matches!(
+            crate::util::program_command("pnpm").arg("--version").output(),
+            Ok(out) if out.status.success()
+        )
+    }
+
+    /// A6 回归：缺依赖时给出明确、可操作的「需准备依赖」错误，**不触发安装**。
+    ///
+    /// 变异验证：把 `require_dependencies` 换回会 `pnpm install` 的实现，本用例
+    /// 会因为错误码不再是 `PreviewDependenciesMissing`（或目录里出现
+    /// `node_modules`）而变红。
+    #[test]
+    fn missing_dependencies_report_actionable_error_without_installing() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        bare_install_dir(&site, true);
+
+        let workspace = crate::workspace::Workspace::open(site.clone()).unwrap();
+        let engine = PreviewEngine::new(&workspace, dir.path().join("preview"), "file:///nowhere");
+
+        let err = engine.require_dependencies(&site).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PreviewDependenciesMissing, "{err:?}");
+        assert!(err.message.contains("准备"), "错误信息必须指向可操作动作：{}", err.message);
+        // 缺依赖时不得留下任何依赖目录：安装不是本路径的职责。
+        assert!(!site.join("node_modules").exists(), "启动预览路径不得安装依赖");
+    }
+
+    /// 依赖已存在时 `require_dependencies` 直接放行（复用而非安装）。
+    #[test]
+    fn existing_dependencies_are_accepted_without_installing() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(site.join("node_modules/astro")).unwrap();
+
+        let workspace = crate::workspace::Workspace::open(site.clone()).unwrap();
+        let engine = PreviewEngine::new(&workspace, dir.path().join("preview"), "file:///nowhere");
+        engine.require_dependencies(&site).expect("已有依赖时应放行");
+    }
+
+    /// A6：同一个准备任务被重复请求时只执行一次，且返回同一个任务标识。
+    ///
+    /// 用一次性信号量把任务**钉在运行中**，避免依赖线程调度顺序。
+    #[test]
+    fn repeated_prepare_requests_share_one_real_task() {
+        use std::sync::mpsc;
+
+        let tasks = PreviewDependencyTasks::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let first = tasks.start({
+            let runs = Arc::clone(&runs);
+            move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = started_tx.send(());
+                // 一直等到测试放行，任务才允许结束。
+                let _ = release_rx.recv();
+                Ok(())
+            }
+        });
+        let first_id = match &first {
+            PreviewDependencyStatus::Preparing { task_id, .. } => task_id.clone(),
+            other => panic!("首次请求应登记真实任务：{other:?}"),
+        };
+
+        // 等任务真正进入运行（否则断言「只跑一次」会因为线程还没被调度而失效）。
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("准备任务应在 5 秒内开始运行");
+
+        // 第二次请求：必须复用同一个任务，不能重复安装。
+        let second = tasks.start({
+            let runs = Arc::clone(&runs);
+            move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        assert_eq!(second.task_id(), Some(first_id.as_str()), "重复请求应复用同一任务");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "安装只能跑一次");
+
+        let _ = release_tx.send(());
+
+        // 任务收尾后状态必须变成「已就绪」且仍带那个任务标识。
+        match wait_for_settled(&tasks, Duration::from_secs(5)) {
+            PreviewDependencyStatus::Ready { task_id, .. } => {
+                assert_eq!(task_id.as_deref(), Some(first_id.as_str()));
+            }
+            other => panic!("任务完成后应变为就绪：{other:?}"),
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "全程只应执行一次");
+    }
+
+    /// A6：安装失败必须变成可操作状态（带原因），而不是静默失败或谎报成功。
+    #[test]
+    fn prepare_task_failure_surfaces_actionable_status() {
+        let tasks = PreviewDependencyTasks::new();
+        let started = tasks.start(|| {
+            Err(WriterError::new(ErrorCode::ToolchainMissing, "未找到 pnpm，无法准备预览依赖"))
+        });
+        let started_id = started
+            .task_id()
+            .expect("登记时应立即有任务标识")
+            .to_string();
+
+        let settled = wait_for_settled(&tasks, Duration::from_secs(5));
+        match settled {
+            PreviewDependencyStatus::Failed { task_id, reason, .. } => {
+                assert_eq!(task_id, started_id);
+                assert!(reason.contains("pnpm"), "失败原因要能指导下一步：{reason}");
+            }
+            other => panic!("失败任务应记为失败：{other:?}"),
+        }
+    }
+
+    /// A6：超时必须变成可操作状态，并且真的终止了卡住的子进程。
+    ///
+    /// 用 `git hash-object -w --stdin` 且不写 stdin 造一个必然阻塞的子进程，
+    /// 不依赖网络与 pnpm；超时后断言进程已被终止、状态说明包含「超时」。
+    #[test]
+    fn prepare_task_timeout_terminates_child_and_reports_status() {
+        let tasks = PreviewDependencyTasks::new();
+        let started = tasks.start(|| {
+            let mut child = crate::util::program_command("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| {
+                    WriterError::new(ErrorCode::ToolchainMissing, format!("未找到 git：{e}"))
+                })?;
+            match wait_for_process_with_timeout(&mut child, Duration::from_millis(300))? {
+                ProcessWait::TimedOut => Err(WriterError::new(
+                    ErrorCode::PreviewFailed,
+                    "准备预览依赖超时（超过 0 秒），已终止安装",
+                )),
+                ProcessWait::Exited(_) => Ok(()),
+            }
+        });
+        assert!(started.is_preparing(), "登记后应是进行中：{started:?}");
+
+        let settled = wait_for_settled(&tasks, Duration::from_secs(10));
+        match settled {
+            PreviewDependencyStatus::Failed { reason, .. } => {
+                assert!(reason.contains("超时"), "超时必须如实说明：{reason}");
+            }
+            other => panic!("超时应记为失败：{other:?}"),
+        }
+    }
+
+    /// 真实的安装失败：`preinstall` 脚本以非零码退出时，`pnpm install` 必须以
+    /// 非零码结束，并转成可操作状态；本用例完全离线，不依赖网络。
+    ///
+    /// 夹具用 `pnpm install --lockfile-only` 先生成锁文件，再写入失败的
+    /// `preinstall`，确保失败原因来自脚本而不是缺锁文件。
+    #[test]
+    fn real_install_failure_is_reported_with_actionable_detail() {
+        if !pnpm_available() {
+            eprintln!("[跳过] 未找到 pnpm");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        bare_install_dir(&site, false);
+        let prepared = crate::util::program_command("pnpm")
+            .current_dir(&site)
+            .args(["install", "--lockfile-only"])
+            .output();
+        if !matches!(prepared, Ok(ref out) if out.status.success()) {
+            eprintln!("[跳过] 无法在夹具中生成锁文件");
+            return;
+        }
+        // 失败的安装脚本：输出里带上可核对的关键词。
+        std::fs::write(
+            site.join("package.json"),
+            "{\n  \"name\": \"deps-fixture\",\n  \"private\": true,\n  \"scripts\": { \"preinstall\": \"node -e \\\"console.error('frozen lockfile exploded'); process.exit(7)\\\"\" }\n}\n",
+        )
+        .unwrap();
+
+        let workspace = crate::workspace::Workspace::open(site.clone()).unwrap();
+        let engine = PreviewEngine::new(&workspace, dir.path().join("preview"), "file:///nowhere");
+        let err = engine
+            .prepare_dependencies(Duration::from_secs(180))
+            .expect_err("安装脚本失败时准备必须失败");
+
+        assert_eq!(err.code, ErrorCode::PreviewFailed, "{err:?}");
+        let detail = err.detail.unwrap_or_default();
+        assert!(!detail.is_empty(), "失败必须带可核对的摘要");
+        assert!(detail.contains("exploded"), "摘要应来自真实输出：{detail}");
+    }
+
+    /// 真实安装成功：依赖装进工作区克隆，之后预览副本可直接复用。
+    #[test]
+    fn real_install_marks_workspace_dependencies_ready() {
+        if !pnpm_available() {
+            eprintln!("[跳过] 未找到 pnpm");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        // 无依赖项的工程也能装出一份 node_modules，且完全离线。
+        bare_install_dir(&site, false);
+        let lock = crate::util::program_command("pnpm")
+            .current_dir(&site)
+            .args(["install", "--lockfile-only"])
+            .output();
+        if !matches!(lock, Ok(ref out) if out.status.success()) {
+            eprintln!("[跳过] 无法在夹具中生成锁文件");
+            return;
+        }
+
+        let workspace = crate::workspace::Workspace::open(site.clone()).unwrap();
+        let engine = PreviewEngine::new(&workspace, dir.path().join("preview"), "file:///nowhere");
+        assert!(!engine.workspace_dependencies_ready());
+        engine
+            .prepare_dependencies(Duration::from_secs(180))
+            .expect("应能安装依赖");
+        assert!(engine.workspace_dependencies_ready(), "安装后工作区应已有依赖");
+    }
+
+    /// 轮询等待任务离开「进行中」，返回最终状态。
+    fn wait_for_settled(tasks: &PreviewDependencyTasks, timeout: Duration) -> PreviewDependencyStatus {
+        let started = std::time::Instant::now();
+        loop {
+            let status = tasks.status();
+            if !status.is_preparing() {
+                return status;
+            }
+            if started.elapsed() >= timeout {
+                panic!("任务在 {timeout:?} 内未结束：{status:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

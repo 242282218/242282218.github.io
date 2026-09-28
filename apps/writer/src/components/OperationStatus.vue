@@ -14,6 +14,8 @@ const props = defineProps<{
   /** 上一次操作的失败信息。 */
   lastError?: { message: string; detail?: string } | null
   busy?: boolean
+  /** 正在核对远端状态。 */
+  checking?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -22,6 +24,8 @@ const emit = defineEmits<{
 }>()
 
 const SITE_LABELS: Record<SiteState, string> = {
+  // 未知必须与「尚未发布」分开：核对失败时不能说「尚未发布到网站」。
+  unverified: '网站状态待核对',
   'never-published': '尚未发布到网站',
   'live-old-version': '网站仍在展示上次发布的版本',
   'publication-submitted': '已提交发布，部署结果待确认',
@@ -34,6 +38,21 @@ const SITE_LABELS: Record<SiteState, string> = {
 const siteText = computed(() =>
   props.status ? SITE_LABELS[props.status.site] : '尚未选择文章',
 )
+
+/**
+ * 未核对时展示原因，让用户知道「不知道」是因为没查、还是查询失败。
+ *
+ * 这里刻意不显示「已同步」「从未发布」等肯定结论——未知不等于否定。
+ */
+const unverifiedReason = computed(() => {
+  if (!props.status) return null
+  if (props.status.remoteSync !== 'unverified' && props.status.site !== 'unverified') return null
+  return (
+    props.status.writing.reason ??
+    props.status.main.reason ??
+    '尚未核对远端状态；打开文章或手动刷新后可获得结论'
+  )
+})
 
 /** 部署结论是否来自真实查询。 */
 const deploymentChecked = computed(() => props.deployment?.checked === true)
@@ -65,6 +84,8 @@ const localText = computed(() => {
 const remoteText = computed(() => {
   if (!props.status) return ''
   switch (props.status.remoteSync) {
+    case 'unverified':
+      return '写作分支状态待核对'
     case 'local-only':
       return '尚未同步到写作分支'
     case 'saving':
@@ -95,7 +116,12 @@ const remoteText = computed(() => {
         <span class="subtle">{{ siteText }}</span>
       </span>
       <span v-if="busy" class="badge info">操作进行中…</span>
+      <span v-if="checking" class="badge info">正在核对远端…</span>
     </div>
+
+    <p v-if="unverifiedReason" class="subtle unverified-note">
+      {{ unverifiedReason }}
+    </p>
 
     <div v-if="deployment" class="deployment-row">
       <span :class="['badge', deploymentChecked ? (deployment.state === 'live-current-version' ? 'ok' : deployment.state === 'deploy-failed' ? 'danger' : 'info') : 'warn']">
@@ -164,5 +190,10 @@ button.small {
 .op-error {
   margin: 8px 0 0;
   font-size: 13px;
+}
+
+.unverified-note {
+  margin: 8px 0 0;
+  font-size: 12px;
 }
 </style>

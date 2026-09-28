@@ -13,11 +13,15 @@ import type {
   ArticleContent,
   ArticleFilter,
   ArticleMeta,
+  ArticleStatus,
   ArticleSort,
   ArticleSummary,
+  BranchCheck,
   ConnectionStatus,
   DeleteAssessment,
+  PreviewDependencyStatus,
   RecoveryDraft,
+  RemoteCheckOutcome,
   SyncAssessment,
   TrashEntry,
   UpdatedDateAction,
@@ -67,11 +71,33 @@ export function useArticle() {
   const previewBanner = ref<string>('')
   const previewNotice = ref<string | null>(null)
   const previewStarting = ref(false)
+  /** 预览依赖的准备状态（不安装时为 `missing`）。 */
+  const previewDependency = ref<PreviewDependencyStatus>({ kind: 'missing' })
+  const previewDependencyError = shallowRef<WriterError | null>(null)
+  /** 是否正有一个用户触发的依赖准备在轮询等待。 */
+  const previewDependenciesPreparing = ref(false)
 
   let debounceTimer: number | null = null
   let flushPromise: Promise<void> | null = null
   /** 崩溃恢复快照的轻量防抖计时器（与保存防抖独立、更短）。 */
   let snapshotTimer: number | null = null
+
+  // ---- 远端核对调度 ----
+  /** 单调递增的请求序号：用于丢弃切换文章后才返回的旧核对结果。 */
+  let remoteCheckSeq = 0
+  /** 当前正在核对的文章 ID → 序号，用于同一篇文章的去重。 */
+  const inFlightChecks = new Map<string, number>()
+  /**
+   * 待核对队列：单槽，后来者覆盖前者。
+   *
+   * 连续切换文章会产生多个核对请求，但只有用户最后停在的那篇值得查——中间
+   * 掠过的文章查完也没人看。单槽 + 只保留最新一篇，既避免任务积压，也保证
+   * 不会同时跑多个 `git fetch` 互相争抢。
+   */
+  let queuedCheck: string | null = null
+  /** 界面用的核对中标记（按文章 ID）。 */
+  const checkingRemote = ref<string | null>(null)
+  const remoteCheckError = shallowRef<WriterError | null>(null)
 
   const visibleArticles = computed(() =>
     sortArticles(searchArticles(filterArticles(articles.value, filter.value), query.value), sort.value),
@@ -128,7 +154,13 @@ export function useArticle() {
 
   async function refreshAll(): Promise<void> {
     if (!connection.value?.connected) return
-    await Promise.all([refreshList(), refreshTrash(), refreshRecovery(), refreshPreferences()])
+    await Promise.all([
+      refreshList(),
+      refreshTrash(),
+      refreshRecovery(),
+      refreshPreferences(),
+      refreshPreviewDependencyStatus(),
+    ])
   }
 
   async function refreshList(): Promise<void> {
@@ -167,11 +199,102 @@ export function useArticle() {
     }
   }
 
+  // ---------------------------------------------------------------- 远端核对
+
+  /**
+   * 把一次核对结果写回界面。
+   *
+   * 两道校验，任一不过就**整体丢弃**：
+   * 1. 请求序号仍是该文章最新的一次（切换文章后返回的旧请求作废）；
+   * 2. 结果携带的本地哈希与当前磁盘内容一致（核对期间又编辑过则作废）。
+   *
+   * 状态是整体替换而不是逐字段合并：远端结论必须与它依据的本地内容版本成套，
+   * 否则会出现「新正文 ＋ 旧远端结论」这种自相矛盾的显示。
+   */
+  function applyRemoteCheck(outcome: RemoteCheckOutcome): void {
+    if (inFlightChecks.get(outcome.articleId) !== remoteCheckSeq) return
+    const entry = articles.value.find((article) => article.id === outcome.articleId)
+    if (entry && entry.status.localBodyHash !== outcome.localBodyHash) {
+      // 本地内容已变化：这条结论依据的内容版本过期了，不能写进列表。
+      return
+    }
+    if (current.value?.id === outcome.articleId && current.value.contentHash === outcome.localBodyHash) {
+      current.value = { ...current.value, status: outcome.status }
+    }
+    if (entry) {
+      entry.status = outcome.status
+    }
+  }
+
+  /**
+   * 核对一篇文章的远端状态（联网）。同一篇文章同时只跑一个请求，重复调用直接复用。
+   *
+   * 这是**唯一**会联网读取远端的路径（另有同步/发布的预检各自核对）。
+   * 保存路径绝不调用它。核对串行执行：忙时把请求放进单槽队列，只保留最新一篇。
+   */
+  async function checkRemote(articleId: string): Promise<void> {
+    if (inFlightChecks.has(articleId)) return
+    // 已有核对在跑：排队等候，且只保留最后请求的那一篇。
+    if (checkingRemote.value !== null) {
+      queuedCheck = articleId
+      return
+    }
+    const seq = ++remoteCheckSeq
+    inFlightChecks.set(articleId, seq)
+    checkingRemote.value = articleId
+    try {
+      const outcome = await backend.checkArticleRemote(articleId)
+      applyRemoteCheck(outcome)
+      remoteCheckError.value = null
+    } catch (error) {
+      // 核对失败把原因交给界面显示「待核对」，不影响编辑。
+      remoteCheckError.value = toWriterError(error)
+    } finally {
+      if (inFlightChecks.get(articleId) === seq) {
+        inFlightChecks.delete(articleId)
+      }
+      checkingRemote.value = null
+      // 取出排队的那一篇继续；期间又排了新的就再排一次。
+      const next = queuedCheck
+      queuedCheck = null
+      if (next) {
+        void checkRemote(next)
+      }
+    }
+  }
+
+  /** 手动刷新当前文章的远端状态。 */
+  async function refreshRemoteNow(articleId?: string): Promise<void> {
+    const id = articleId ?? current.value?.id
+    if (!id) return
+    // 手动刷新是显式意图：即使该文章正在核对中，也要在它跑完后重新查一次。
+    if (checkingRemote.value !== null) {
+      queuedCheck = id
+      return
+    }
+    await checkRemote(id)
+  }
+
   // ---------------------------------------------------------------- 编辑
 
+  /**
+   * 打开一篇文章。
+   *
+   * 切换前必须先 flush，避免上一篇的改动被丢掉。**flush 失败时必须中断切换**：
+   * `flush()` 把失败降级为界面状态（`saveState = 'failed'`）而不抛错，若继续读入
+   * 新文章，上一篇尚未落盘的正文会被整体替换，用户能看到的就只剩恢复副本——
+   * 与「保存失败却继续远端操作」是同一类问题，故与 `flushBeforeRemote` 同源处理。
+   */
   async function openArticle(articleId: string): Promise<void> {
-    // 切换文章前必须先 flush，避免上一篇的改动被丢掉。
     await flush()
+    if (saveState.value === 'failed') {
+      throw (
+        saveError.value ?? {
+          code: 'io-failed' as const,
+          message: '本地保存失败，已停止切换文章；当前草稿仍保留在编辑器中',
+        }
+      )
+    }
     const content = await backend.readArticle(articleId)
     current.value = content
     draftMeta.value = { ...content.meta }
@@ -179,6 +302,8 @@ export function useArticle() {
     saveState.value = 'idle'
     saveError.value = null
     conflict.value = null
+    // 本地内容先展示，再异步补远端结论：不要求网络「秒开」。
+    void checkRemote(articleId)
   }
 
   function markDirty(): void {
@@ -234,9 +359,67 @@ export function useArticle() {
   }
 
   /**
+   * 把「刚保存的本地内容」应用到列表项。
+   *
+   * 不重新拉列表：`list_articles` 会扫描整个工作区并读取远端缓存，放在保存
+   * 路径上会让每次自动保存都变成一次重型操作。这里只用保存返回值更新**本地
+   * 字段**，并且**不照搬它的远端状态**——`workspace.save` 返回的默认快照不是
+   * 远端事实，照搬会把「未核对」写成「已同步」。
+   *
+   * 本地原文变了就意味着旧的远端结论（如果曾核实过）已经对不上当前内容，
+   * 因此把两个分支的结论降级为「待核对 ＋ 原因」，等用户打开文章或手动刷新
+   * 时再重新核对。
+   */
+  function applySavedContent(content: ArticleContent, localChanged: boolean): void {
+    const entry = articles.value.find((article) => article.id === content.id)
+    if (!entry) return
+    entry.title = content.meta.title
+    entry.description = content.meta.description
+    entry.tags = content.meta.tags
+    entry.pubDate = content.meta.pubDate
+    // 可选字段用 delete 清空：`exactOptionalPropertyTypes` 下不能赋值 undefined。
+    if (content.meta.updatedDate === undefined) {
+      delete entry.updatedDate
+    } else {
+      entry.updatedDate = content.meta.updatedDate
+    }
+    entry.draft = content.meta.draft
+    // 保存成功后这条记录已能正常解析，之前的读取错误不再成立。
+    delete entry.loadError
+    entry.status = localChanged ? staleStatus(content.status) : content.status
+  }
+
+  /**
+   * 本地内容变化后，把旧的远端结论降级为「待核对」。
+   *
+   * 保留本地哈希（它是当前磁盘事实），远端两分支一律标为未核对并说明原因。
+   */
+  function staleStatus(base: ArticleStatus): ArticleStatus {
+    const reason = '本地已改动，远端状态待重新核对'
+    const stale: BranchCheck = { state: 'unverified', reason }
+    const next: ArticleStatus = {
+      ...base,
+      remoteSync: 'unverified',
+      site: 'unverified',
+      writing: stale,
+      main: stale,
+    }
+    // 上次核对时间保留为历史信息：它记录的是「什么时候查过」，不是当前结论。
+    if (base.remoteCheckedAtUnix === undefined) {
+      delete next.remoteCheckedAtUnix
+    } else {
+      next.remoteCheckedAtUnix = base.remoteCheckedAtUnix
+    }
+    return next
+  }
+
+  /**
    * 立即把当前编辑写入磁盘。
    *
    * 返回的 Promise 可被 await，保证切换文章／关闭窗口时不会丢失改动。
+   *
+   * **保存路径完全离线**：只调 `save_article`（本地写入）与恢复副本清理，
+   * 不刷新列表、不核对远端。打开文章后的一次异步核对是唯一的读取远端时机。
    */
   async function flush(updatedDateAction?: UpdatedDateAction): Promise<void> {
     if (debounceTimer !== null) {
@@ -253,6 +436,7 @@ export function useArticle() {
     }
 
     const articleId = current.value.id
+    const previousHash = current.value.contentHash
     const meta = { ...draftMeta.value }
     const body = draftBody.value
     saveState.value = 'saving'
@@ -268,6 +452,8 @@ export function useArticle() {
           saveState.value = 'saved'
           saveError.value = null
           lastSavedAt.value = Date.now()
+          // 磁盘原文确实变了：旧的远端结论已失效，降级为待核对。
+          applySavedContent(saved, saved.contentHash !== previousHash)
           // 内容已落盘，清除恢复快照，避免下次启动误报「未保存内容」。
           if (snapshotTimer !== null) {
             window.clearTimeout(snapshotTimer)
@@ -283,7 +469,6 @@ export function useArticle() {
           scheduleAutoSave()
           scheduleRecoverySnapshot()
         }
-        await refreshList()
       } catch (error) {
         // 失败必须如实显示，不能给绿色成功。
         saveError.value = toWriterError(error)
@@ -492,6 +677,16 @@ export function useArticle() {
     return content
   }
 
+  /**
+   * 把一篇文章的磁盘原文导出到用户选定的绝对路径。
+   *
+   * 纯本地只读：不触碰工作区、不做远端操作，因此不刷新列表。
+   * 调用方应先 `flushBeforeRemote()`，保证导出的是磁盘上与界面一致的内容。
+   */
+  async function exportArticle(articleId: string, targetPath: string): Promise<void> {
+    await backend.exportArticle(articleId, targetPath)
+  }
+
   // ---------------------------------------------------------------- URL 改名
 
   async function assessRename(oldId: string, newId: string) {
@@ -522,8 +717,58 @@ export function useArticle() {
       previewBanner.value = info.banner
       previewNotice.value = info.offlineFontNotice ?? null
       return info
+    } catch (error) {
+      const mapped = toWriterError(error)
+      // 缺依赖是可操作状态：让界面显示「需准备依赖」，而不是一句笼统的失败。
+      if (mapped.code === 'preview-dependencies-missing') {
+        void refreshPreviewDependencyStatus()
+      }
+      throw mapped
     } finally {
       previewStarting.value = false
+    }
+  }
+
+  /** 查询预览依赖准备状态（不启动任务）。 */
+  async function refreshPreviewDependencyStatus(): Promise<PreviewDependencyStatus> {
+    try {
+      previewDependency.value = await backend.previewDependencyStatus()
+    } catch (error) {
+      previewDependencyError.value = toWriterError(error)
+    }
+    return previewDependency.value
+  }
+
+  /**
+   * 请求准备预览依赖。
+   *
+   * 后端只登记真实任务并立即返回，安装在线程内进行；这里在「进行中」期间轮询状态，
+   * 直到得到就绪或失败。轮询在组件销毁或用户停止后自然结束（同一 view 实例内串行）。
+   */
+  async function preparePreviewDependencies(): Promise<PreviewDependencyStatus> {
+    previewDependenciesPreparing.value = true
+    try {
+      let status = await backend.preparePreviewDependencies()
+      previewDependency.value = status
+      previewDependencyError.value = null
+      while (status.kind === 'preparing') {
+        await new Promise((resolve) => window.setTimeout(resolve, 700))
+        status = await backend.previewDependencyStatus()
+        previewDependency.value = status
+      }
+      if (status.kind === 'failed') {
+        previewDependencyError.value = {
+          code: 'preview-failed',
+          message: status.reason,
+          ...(status.detail ? { detail: status.detail } : {}),
+        }
+      }
+      return status
+    } catch (error) {
+      previewDependencyError.value = toWriterError(error)
+      throw previewDependencyError.value
+    } finally {
+      previewDependenciesPreparing.value = false
     }
   }
 
@@ -605,9 +850,14 @@ export function useArticle() {
     previewBanner,
     previewNotice,
     previewStarting,
+    previewDependency,
+    previewDependencyError,
+    previewDependenciesPreparing,
     visibleArticles,
     hasUnsavedChanges,
     wordCount,
+    checkingRemote,
+    remoteCheckError,
     // 动作
     refreshConnection,
     acknowledgeDisclosure,
@@ -618,10 +868,13 @@ export function useArticle() {
     refreshRecovery,
     refreshPreferences,
     openArticle,
+    checkRemote,
+    refreshRemoteNow,
     flush,
     flushBeforeRemote,
     createArticle,
     importArticle,
+    exportArticle,
     insertImage,
     insertImageBytes,
     listImages,
@@ -644,6 +897,8 @@ export function useArticle() {
     savePreferences,
     startSitePreview,
     stopSitePreview,
+    refreshPreviewDependencyStatus,
+    preparePreviewDependencies,
     deploymentStatus,
   }
 }

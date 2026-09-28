@@ -74,6 +74,8 @@ pub struct ArticleMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteSync {
+    /// 远端状态**尚未核对**（或核对失败）。不得据此推断「已同步」或「尚未同步」。
+    Unverified,
     LocalOnly,
     Saving,
     Saved,
@@ -85,6 +87,8 @@ pub enum RemoteSync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SiteState {
+    /// 网站状态**尚未核对**（或核对失败）。不得据此推断「从未发布」或「已上线」。
+    Unverified,
     NeverPublished,
     LiveOldVersion,
     PublicationSubmitted,
@@ -92,6 +96,96 @@ pub enum SiteState {
     LiveCurrentVersion,
     DeployFailed,
     Withdrawn,
+}
+
+/// 单个远端分支上一次核对的结论类别。
+///
+/// `None`（缺值）无法区分「没查过」「查了但失败」「确认不存在」——三者对用户
+/// 意味着完全不同的下一步操作，因此必须分开表达，未知一律不得等同于肯定结论。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckState {
+    /// 尚未核对，或核对失败（超时、断网、认证受阻、读取异常）。
+    #[default]
+    Unverified,
+    /// 已核对：该分支或该文章确实不存在。
+    Absent,
+    /// 已核对：该分支上存在该文章。
+    Present,
+}
+
+/// 单个远端分支上该文章的核对结论。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchCheck {
+    pub state: CheckState,
+    /// 未核对时的原因（面向用户），`state == unverified` 时展示。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 核对时所依据的远端头。已核对时为 `Some`（分支不存在则为 `None`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// 核对时间（Unix 秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at_unix: Option<u64>,
+    /// 该文件的原始内容哈希（`present` 时才有值，含 `draft` 字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    /// 该文件按「网站发布版」规范化后的哈希（`present` 时才有值）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_hash: Option<String>,
+    /// 该分支上是否公开（`draft: false`）。只有 `main` 上有意义。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<bool>,
+    /// 该分支上该文章记录的上线地址。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_url: Option<String>,
+}
+
+impl BranchCheck {
+    /// 未核对（可带原因）。
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self { state: CheckState::Unverified, reason: Some(reason.into()), ..Default::default() }
+    }
+
+    /// 已核对但该分支上不存在该文章。
+    pub fn absent(head: Option<String>, checked_at_unix: u64) -> Self {
+        Self {
+            state: CheckState::Absent,
+            head,
+            checked_at_unix: Some(checked_at_unix),
+            ..Default::default()
+        }
+    }
+
+    /// 已核对且存在。
+    pub fn present(
+        head: Option<String>,
+        checked_at_unix: u64,
+        body_hash: String,
+        site_hash: Option<String>,
+        published: Option<bool>,
+        deployment_url: Option<String>,
+    ) -> Self {
+        Self {
+            state: CheckState::Present,
+            head,
+            checked_at_unix: Some(checked_at_unix),
+            body_hash: Some(body_hash),
+            site_hash,
+            published,
+            deployment_url,
+            ..Default::default()
+        }
+    }
+
+    pub fn is_verified(&self) -> bool {
+        self.state != CheckState::Unverified
+    }
+
+    pub fn is_present(&self) -> bool {
+        self.state == CheckState::Present
+    }
 }
 
 /// 文章在其三处位置（本地 / writing / main）的版本对照。
@@ -103,28 +197,28 @@ pub struct ArticleStatus {
     pub site: SiteState,
     /// 文章文件的完整内容哈希，而非仅正文。
     pub local_body_hash: String,
+    /// `writing` 分支的核对结论（含未核对态）。
+    pub writing: BranchCheck,
+    /// `main` 分支的核对结论（含未核对态）。
+    pub main: BranchCheck,
+    /// 远端核对时间（两个分支中最近一次已核对的时间）。未核对时为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub writing_body_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub main_body_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub main_commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_url: Option<String>,
+    pub remote_checked_at_unix: Option<u64>,
 }
 
 impl ArticleStatus {
     /// 本地内容尚未纳入任何状态推导时的占位值。
+    ///
+    /// 远端两分支都是「未核对」：新建文章从未查过远端，不能声称「尚未同步」。
     pub fn local_only(local_body_hash: impl Into<String>) -> Self {
         Self {
             locally_saved: true,
-            remote_sync: RemoteSync::LocalOnly,
-            site: SiteState::NeverPublished,
+            remote_sync: RemoteSync::Unverified,
+            site: SiteState::Unverified,
             local_body_hash: local_body_hash.into(),
-            writing_body_hash: None,
-            main_body_hash: None,
-            main_commit: None,
-            deployment_url: None,
+            writing: BranchCheck::default(),
+            main: BranchCheck::default(),
+            remote_checked_at_unix: None,
         }
     }
 }
@@ -225,6 +319,8 @@ pub enum ErrorCode {
     ToolchainMissing,
     /// 本地预览不可用。
     PreviewFailed,
+    /// 网站预览所需的依赖尚未准备（不会在启动预览时自行安装）。
+    PreviewDependenciesMissing,
     /// 构建或部署失败。
     BuildFailed,
     /// 磁盘错误。
@@ -253,6 +349,7 @@ impl ErrorCode {
             Self::Offline => "offline",
             Self::ToolchainMissing => "toolchain-missing",
             Self::PreviewFailed => "preview-failed",
+            Self::PreviewDependenciesMissing => "preview-dependencies-missing",
             Self::BuildFailed => "build-failed",
             Self::IoFailed => "io-failed",
             Self::InvalidArgument => "invalid-argument",

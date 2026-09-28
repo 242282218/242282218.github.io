@@ -255,6 +255,27 @@ const hasArticles = computed(() => props.articles.length > 0)
   max-width: 100%;
 }
 
+/*
+ * 选中态（施工单 §3.1-2 点名要补的缺口）。
+ *
+ * 只靠颜色不够：左侧竖条 + 表面底色 + 强调色标题三者同时变化，
+ * 保证在灰度或低对比环境下仍能分辨当前文章。
+ */
+.item.selected {
+  background: var(--gl-accent-soft);
+  border-color: var(--gl-accent);
+  box-shadow: inset 3px 0 0 var(--gl-accent);
+}
+
+.item.selected .item-title {
+  color: var(--gl-accent);
+}
+
+.item.selected:hover {
+  background: var(--gl-accent-soft);
+  border-color: var(--gl-accent);
+}
+
 .item-meta {
   display: flex;
   gap: 6px;

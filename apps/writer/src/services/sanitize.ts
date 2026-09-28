@@ -29,8 +29,16 @@ const ALLOWED_ATTRS = new Set([
 /** 链接协议白名单。 */
 const SAFE_URL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:'])
 
-/** 图片协议白名单（含站点内相对路径与本地预览地址）。 */
-const SAFE_IMAGE_SCHEMES = new Set(['http:', 'https:', 'data:'])
+/**
+ * 图片协议白名单。
+ *
+ * 与 `tauri.conf.json` 的 CSP（`img-src 'self' asset: data: blob: http://127.0.0.1:*
+ * http://localhost:*`）保持一致：站内相对路径、内联数据与本机预览服务，**不含**
+ * 任意 http/https 远端。预览必须完全离线——保留远端图片会让文章正文在写
+ * 「看预览」时向第三方发起请求，既违反离线约束，也泄露访问行为。
+ */
+const LOCAL_IMAGE_HOSTS = new Set(['127.0.0.1', 'localhost'])
+const SAFE_IMAGE_SCHEMES = new Set(['data:', 'blob:', 'asset:'])
 
 /** 直接丢弃整个子树的标签。 */
 const DROP_SUBTREE = new Set([
@@ -50,7 +58,41 @@ function isSafeUrl(value: string, forImage: boolean): boolean {
   const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(compact)
   if (!schemeMatch) return true // 无协议的相对路径。
   const scheme = `${schemeMatch[1]?.toLowerCase() ?? ''}:`
-  return forImage ? SAFE_IMAGE_SCHEMES.has(scheme) : SAFE_URL_SCHEMES.has(scheme)
+  if (!forImage) return SAFE_URL_SCHEMES.has(scheme)
+  if (SAFE_IMAGE_SCHEMES.has(scheme)) return true
+  // http(s) 只允许本机预览服务（与 CSP 的 img-src 一致）。
+  if (scheme === 'http:' || scheme === 'https:') return isLocalHttpUrl(compact)
+  return false
+}
+
+/** 判断一个 http(s) URL 是否指向本机（预览服务只绑定 127.0.0.1）。 */
+function isLocalHttpUrl(url: string): boolean {
+  const match = /^https?:\/\/([^/?#]+)/i.exec(url)
+  if (!match) return false
+  // 去掉 userinfo 与端口后再比较主机名，避免 `127.0.0.1@evil.invalid` 这类写法。
+  const authority = match[1] ?? ''
+  const host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '')
+  return LOCAL_IMAGE_HOSTS.has(host.toLowerCase())
+}
+
+/**
+ * 校验 `srcset` 的**每一个候选**。
+ *
+ * `srcset` 是「URL + 描述符」的逗号分隔列表；把整个属性值当成单条 URL 检查，
+ * 会让 `data:,x 1x, https://evil.invalid/p.png 2x` 这类值凭首个候选通过，而
+ * 实际加载时浏览器可能选中后面那个。任一候选不安全即整条属性丢弃。
+ */
+function isSafeSrcset(value: string): boolean {
+  const candidates = value
+    .split(',')
+    .map((candidate) => candidate.trim())
+    .filter((candidate) => candidate.length > 0)
+  if (candidates.length === 0) return false
+  return candidates.every((candidate) => {
+    // 候选形如 `url 2x` / `url 100w`，描述符与 URL 之间用空白分隔。
+    const url = candidate.split(/\s+/)[0] ?? ''
+    return url.length > 0 && isSafeUrl(url, true)
+  })
 }
 
 /**
@@ -96,7 +138,14 @@ export function sanitizeHtml(html: string): string {
         element.removeAttribute(attr.name)
         continue
       }
-      if ((name === 'href' || name === 'src' || name === 'srcset') && !isSafeUrl(attr.value, name !== 'href')) {
+      if (name === 'srcset') {
+        // 多候选必须逐个校验，不能按首候选的协议整条放行。
+        if (!isSafeSrcset(attr.value)) {
+          element.removeAttribute(attr.name)
+        }
+        continue
+      }
+      if ((name === 'href' || name === 'src') && !isSafeUrl(attr.value, name === 'src')) {
         element.removeAttribute(attr.name)
       }
     }

@@ -1,0 +1,198 @@
+/*
+ * 站点正文样式的受控快照：由脚本生成，请勿手工修改。
+ *
+ * 来源：src/styles/global.css
+ * 生成：pnpm --dir apps/writer build:preview-css
+ * 作用域：保留站点原选择器（:root / body / .shell / .article / .prose …），由预览组件
+ *         注入**独立文档**（InstantPreview.vue 的 iframe）作为隔离外壳。
+ * 请勿把本文件注入软件主文档：那会把站点的 :root / body / a / * 规则带进软件外壳。
+ * 未复制站点的 @import（Google Fonts）：本软件不打包 webfont，预览保持离线，
+ *         字体走系统回退栈，字形与换行可能与线上不同。
+ */
+
+:root {
+  color-scheme: light;
+  --paper: #f8fafb;
+  --ink: #1f2c3b;
+  --blue: #286697;
+  --blue-deep: #1d557f;
+  --muted: #52697a;
+  --line: #dce5eb;
+  --surface: #eff4f7;
+  font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-synthesis: none;
+  font-size: 16px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+::selection {
+  background: #c6deec;
+  color: var(--ink);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--blue-deep);
+}
+
+a:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+.shell {
+  width: min(100% - 64px, 1000px);
+  margin-inline: auto;
+}
+
+.post-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.article {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 78px 0 115px;
+}
+
+.article-header {
+  padding-bottom: 33px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 35px;
+}
+
+.article-header h1 {
+  font-size: clamp(32px, 4vw, 44px);
+  line-height: 1.47;
+  letter-spacing: -.03em;
+  margin: 16px 0;
+}
+
+.article-description {
+  font-size: 16px;
+  line-height: 1.95;
+  color: var(--muted);
+  margin: 0;
+}
+
+.prose {
+  font-size: 16px;
+  line-height: 2.05;
+  overflow-wrap: break-word;
+}
+
+.prose h2 {
+  font-size: 25px;
+  line-height: 1.55;
+  letter-spacing: -.02em;
+  margin: 50px 0 15px;
+}
+
+.prose h3 {
+  font-size: 20px;
+  line-height: 1.55;
+  margin: 34px 0 13px;
+}
+
+.prose p {
+  margin: 0 0 21px;
+}
+
+.prose a {
+  color: var(--blue-deep);
+  border-bottom: 1px solid currentColor;
+}
+
+.prose ul, .prose ol {
+  padding-left: 1.5em;
+  margin: 0 0 24px;
+}
+
+.prose li {
+  padding-left: .2em;
+  margin: 5px 0;
+}
+
+.prose blockquote {
+  border-left: 3px solid var(--blue);
+  margin: 30px 0;
+  padding: 2px 0 2px 18px;
+  color: var(--muted);
+}
+
+.prose :not(pre) > code {
+  font-size: .9em;
+  background: #e9f1f6;
+  color: #23567a;
+  padding: 2px 5px;
+  border-radius: 3px;
+}
+
+.prose pre {
+  overflow-x: auto;
+  background: #e9f1f6 !important;
+  color: #25435b;
+  padding: 21px;
+  border-radius: 5px;
+  font-size: 14px;
+  line-height: 1.8;
+  margin: 25px 0;
+}
+
+.prose img {
+  display: block;
+  margin: 32px auto;
+  border-radius: 4px;
+}
+
+.prose figure {
+  margin: 32px 0;
+}
+
+.prose figcaption {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.back-link {
+  display: inline-block;
+  color: var(--blue-deep);
+  margin-top: 50px;
+  font-size: 14px;
+}
+
+@media (max-width: 780px) {
+  .shell {
+    width: min(100% - 38px, 1000px);
+  }
+  .article {
+    padding-block: 59px 85px;
+  }
+}
+
+@media (max-width: 420px) {
+  .shell {
+    width: calc(100% - 32px);
+  }
+}

@@ -11,13 +11,36 @@ use crate::local_store::{RecoveryDraft, TrashEntry, WritingPreferences};
 use crate::model::{
     ArticleContent, ArticleMeta, ArticleStatus, ArticleSummary, ErrorCode, WriterError,
 };
-use crate::preview::ToolchainReport;
+use crate::preview::{PreviewDependencyStatus, ToolchainState};
 use crate::publish::{PublishOutcome, PublishPrecheck};
 use crate::sync::{SyncAssessment, SyncOutcome};
 use crate::trash::{DeleteAssessment, DeleteOutcome, WithdrawOutcome};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::app_commands as core;
+
+/// Runs a synchronous business call on the blocking pool.
+///
+/// An `async fn` signature alone does not move blocking work off the IPC path; the
+/// call must be handed to `spawn_blocking`. The closure needs `Send + 'static`, so
+/// this moves the owned `AppHandle` instead of the borrowed `State<'_, AppState>`
+/// and looks the state up inside the closure. Business functions keep taking
+/// `&AppState`, which keeps them directly callable from unit tests.
+///
+/// A `JoinError` carries no business conclusion, so it becomes a structured error
+/// rather than leaving the caller waiting.
+async fn run_blocking<T, F>(app: AppHandle, task: F) -> Result<T, WriterError>
+where
+    F: FnOnce(&AppState) -> Result<T, WriterError> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        task(state.inner())
+    })
+    .await
+    .map_err(|err| WriterError::new(ErrorCode::IoFailed, format!("后台任务未能完成：{err}")))?
+}
 
 /// 首次连接状态。
 #[tauri::command]
@@ -35,29 +58,45 @@ pub fn acknowledge_disclosure(
 
 /// 建立独立工作目录（clone 公开仓库的 main）。
 #[tauri::command]
-pub fn connect(
-    state: State<'_, AppState>,
+pub async fn connect(
+    app: AppHandle,
     workspace_dir: Option<String>,
 ) -> Result<crate::connection::ConnectionStatus, WriterError> {
-    core::connect(&state, workspace_dir)
+    run_blocking(app, move |state| core::connect(state, workspace_dir)).await
 }
 
 /// 探测 Git / Node / pnpm 前置条件。
+///
+/// 这是用户显式触发的真实探测（会启动三个进程，且没有超时）；启动路径只读
+/// `connection_status` 里的缓存状态，不会调用本命令。探测本身是阻塞工作，
+/// 因此和其余重型命令一样交给 blocking 池，避免占用 IPC 线程。
 #[tauri::command]
-pub fn toolchain_report(state: State<'_, AppState>) -> ToolchainReport {
-    core::toolchain_report(&state)
+pub async fn toolchain_report(app: AppHandle) -> Result<ToolchainState, WriterError> {
+    run_blocking(app, |state| core::run_toolchain_check(state)).await
 }
 
 /// 文章列表。
 #[tauri::command]
-pub fn list_articles(state: State<'_, AppState>) -> Result<Vec<ArticleSummary>, WriterError> {
-    core::list_articles(&state)
+pub async fn list_articles(app: AppHandle) -> Result<Vec<ArticleSummary>, WriterError> {
+    run_blocking(app, |state| core::list_articles(state)).await
 }
 
 /// 读取单篇文章。
 #[tauri::command]
-pub fn read_article(state: State<'_, AppState>, article_id: String) -> Result<ArticleContent, WriterError> {
-    core::read_article(&state, article_id)
+pub async fn read_article(
+    app: AppHandle,
+    article_id: String,
+) -> Result<ArticleContent, WriterError> {
+    run_blocking(app, move |state| core::read_article(state, article_id)).await
+}
+
+/// 核对单篇文章的远端状态（联网；打开文章后异步调用一次，或手动刷新）。
+#[tauri::command]
+pub async fn check_article_remote(
+    app: AppHandle,
+    article_id: String,
+) -> Result<core::RemoteCheckOutcome, WriterError> {
+    run_blocking(app, move |state| core::check_article_remote(state, article_id)).await
 }
 
 /// 新建文章。
@@ -91,6 +130,16 @@ pub fn import_article(
     article_id: String,
 ) -> Result<ArticleContent, WriterError> {
     core::import_article(&state, source_path, article_id)
+}
+
+/// 把一篇本地文章的磁盘原文导出到用户选定的绝对路径（不改动工作区）。
+#[tauri::command]
+pub fn export_article(
+    state: State<'_, AppState>,
+    article_id: String,
+    target_path: String,
+) -> Result<(), WriterError> {
+    core::export_article(&state, article_id, target_path)
 }
 
 /// 插入图片：校验后归档到 `public/blog/<article-id>/`。
@@ -181,18 +230,21 @@ pub fn list_article_images(
 
 /// 同步前评估（差异界面数据源）。
 #[tauri::command]
-pub fn assess_sync(state: State<'_, AppState>, article_id: String) -> Result<SyncAssessment, WriterError> {
-    core::assess_sync(&state, article_id)
+pub async fn assess_sync(
+    app: AppHandle,
+    article_id: String,
+) -> Result<SyncAssessment, WriterError> {
+    run_blocking(app, move |state| core::assess_sync(state, article_id)).await
 }
 
 /// 同步到写作分支。
 #[tauri::command]
-pub fn sync_article(
-    state: State<'_, AppState>,
+pub async fn sync_article(
+    app: AppHandle,
     article_id: String,
     adopt_local: bool,
 ) -> Result<SyncOutcome, WriterError> {
-    core::sync_article(&state, article_id, adopt_local)
+    run_blocking(app, move |state| core::sync_article(state, article_id, adopt_local)).await
 }
 
 /// 采用远端版本（本地改动先存入恢复副本）。
@@ -214,61 +266,67 @@ pub fn resolve_conflict_manually(
 
 /// 发布预检。
 #[tauri::command]
-pub fn publish_precheck(
-    state: State<'_, AppState>,
+pub async fn publish_precheck(
+    app: AppHandle,
     article_id: String,
 ) -> Result<PublishPrecheck, WriterError> {
-    core::publish_precheck(&state, article_id)
+    run_blocking(app, move |state| core::publish_precheck(state, article_id)).await
 }
 
 /// 发布到网站（main）。
 #[tauri::command]
-pub fn publish_article(
-    state: State<'_, AppState>,
+pub async fn publish_article(
+    app: AppHandle,
     article_id: String,
     removed_image_paths: Vec<String>,
     remove_old_markdown_path: Option<String>,
 ) -> Result<PublishOutcome, WriterError> {
-    core::publish_article(&state, article_id, removed_image_paths, remove_old_markdown_path)
+    run_blocking(app, move |state| {
+        core::publish_article(state, article_id, removed_image_paths, remove_old_markdown_path)
+    })
+    .await
 }
 
 /// 从网站撤下。
 #[tauri::command]
-pub fn withdraw_article(
-    state: State<'_, AppState>,
+pub async fn withdraw_article(
+    app: AppHandle,
     article_id: String,
 ) -> Result<WithdrawOutcome, WriterError> {
-    core::withdraw_article(&state, article_id)
+    run_blocking(app, move |state| core::withdraw_article(state, article_id)).await
 }
 
 /// 删除影响评估。
 #[tauri::command]
-pub fn assess_delete(
-    state: State<'_, AppState>,
+pub async fn assess_delete(
+    app: AppHandle,
     article_id: String,
 ) -> Result<DeleteAssessment, WriterError> {
-    core::assess_delete(&state, article_id)
+    run_blocking(app, move |state| core::assess_delete(state, article_id)).await
 }
 
 /// 删除文件。
 #[tauri::command]
-pub fn delete_article(
-    state: State<'_, AppState>,
+pub async fn delete_article(
+    app: AppHandle,
     article_id: String,
 ) -> Result<DeleteOutcome, WriterError> {
-    core::delete_article(&state, article_id)
+    run_blocking(app, move |state| core::delete_article(state, article_id)).await
 }
 
 /// 重试未完成的多分支删除。
 #[tauri::command]
-pub fn retry_delete(state: State<'_, AppState>, op_id: String) -> Result<DeleteOutcome, WriterError> {
-    core::retry_delete(&state, op_id)
+pub async fn retry_delete(app: AppHandle, op_id: String) -> Result<DeleteOutcome, WriterError> {
+    run_blocking(app, move |state| core::retry_delete(state, op_id)).await
 }
 
 /// 从回收区恢复为未发布草稿。
 #[tauri::command]
-pub fn restore_article(state: State<'_, AppState>, op_id: String) -> Result<ArticleContent, WriterError> {
-    core::restore_article(&state, op_id)
+pub async fn restore_article(
+    app: AppHandle,
+    op_id: String,
+) -> Result<ArticleContent, WriterError> {
+    run_blocking(app, move |state| core::restore_article(state, op_id)).await
 }
 
 /// 回收区列表。
@@ -362,12 +420,31 @@ pub fn set_preferences(
 
 /// 启动网站预览。
 #[tauri::command]
-pub fn start_site_preview(
-    state: State<'_, AppState>,
+pub async fn start_site_preview(
+    app: AppHandle,
     article_id: String,
     simulate_public: bool,
 ) -> Result<PreviewSessionInfo, WriterError> {
-    core::start_site_preview(&state, article_id, simulate_public)
+    run_blocking(app, move |state| core::start_site_preview(state, article_id, simulate_public)).await
+}
+
+/// 查询预览依赖准备状态（含真实任务标识）；不启动任何任务。
+#[tauri::command]
+pub fn preview_dependency_status(app: AppHandle) -> PreviewDependencyStatus {
+    let state = app.state::<AppState>();
+    core::preview_dependency_status(state.inner())
+}
+
+/// 请求准备网站预览依赖。
+///
+/// 依赖安装可能持续数分钟，因此本命令**不等待安装完成**：它要么回报「已就绪」，
+/// 要么登记一个真实任务并立即返回「进行中」，随后由
+/// [`preview_dependency_status`] 查询结果。重复请求返回同一个任务，不会重复安装。
+#[tauri::command]
+pub async fn prepare_preview_dependencies(
+    app: AppHandle,
+) -> Result<PreviewDependencyStatus, WriterError> {
+    run_blocking(app, |state| core::prepare_site_preview_dependencies(state)).await
 }
 
 /// 关闭网站预览并清理临时目录。
@@ -377,12 +454,14 @@ pub fn stop_site_preview(state: State<'_, AppState>) -> Result<(), WriterError> 
 }
 
 /// 查询部署状态（只读，无凭据）。
+///
+/// 会调用 `curl` 访问 GitHub 公开 API（有 15 秒超时），不能占住 IPC 路径。
 #[tauri::command]
-pub fn deployment_status(
-    state: State<'_, AppState>,
+pub async fn deployment_status(
+    app: AppHandle,
     article_id: String,
 ) -> Result<DeploymentStatus, WriterError> {
-    core::deployment_status(&state, article_id)
+    run_blocking(app, move |state| core::deployment_status(state, article_id)).await
 }
 
 /// 文章状态汇总。

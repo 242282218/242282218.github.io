@@ -10,34 +10,29 @@ use crate::article_io::{self, ParsedMarkdown};
 use crate::images;
 use crate::local_store::{ArticleBaseline, LocalStore};
 use crate::model::{
-    ArticleContent, ArticleMeta, ArticleSource, ArticleStatus, ArticleSummary, ErrorCode,
-    RemoteSync, Result, SiteState, WriterError,
+    ArticleContent, ArticleMeta, ArticleSource, ArticleStatus, ArticleSummary, BranchCheck,
+    CheckState, ErrorCode, RemoteSync, Result, SiteState, WriterError,
 };
 use crate::paths;
 use crate::util;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// 上层注入的远端版本信息（每个字段都是文章文件完整内容的哈希）。
+/// 上层注入的远端版本信息：两个分支各自的核对结论。
+///
+/// 每个分支都用 [`BranchCheck`] 表达「未核对 / 确认不存在 / 有内容」，
+/// 而不是用 `Option<String>`——后者会把 fetch 失败、分支确实不存在与
+/// 单篇读取失败混成同一个「没有值」，界面就无法区分未知与否定结论。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteSnapshot {
-    /// `writing` 上该文件的原始内容哈希（含 `draft` 值）。
-    pub writing_hash: Option<String>,
-    /// `main` 上该文件的原始内容哈希；`None` 表示该文章**不在** `main` 上。
-    pub main_hash: Option<String>,
-    /// `main` 上该文件按「网站发布版」规范化后的哈希（`draft: false`）。
-    pub main_site_hash: Option<String>,
-    /// 该文章当前 `main` 版本所在的提交（即读取内容时用的 `main` 头）。
-    pub main_commit: Option<String>,
-    /// `main` 上该文章是否公开（`draft: false`）。
-    pub main_published: Option<bool>,
+    pub writing: BranchCheck,
+    pub main: BranchCheck,
     /// 最近一次**已确认部署成功**的提交（来自 Pages 工作流，且为 `main` 上的提交）。
     pub deployed_commit: Option<String>,
     /// 最近一次**已确认部署失败**的提交。
     pub deploy_failed_commit: Option<String>,
     /// 最近一次查询到**部署进行中**的提交。
     pub deploying_commit: Option<String>,
-    pub deployment_url: Option<String>,
 }
 
 /// 状态推导的完整输入。
@@ -57,30 +52,40 @@ pub struct StatusInputs {
 /// 这里刻意不使用单一 `published: boolean`：本地、`writing`、`main` 三处
 /// 各自独立表达，且「已提交发布」与「网站已上线」分开。
 ///
+/// **未知不等于否定**：任何分支未核对时，对应结论一律是 `Unverified`，
+/// 绝不显示「已同步」「从未发布」「已上线」等肯定说法。远端核对失败
+/// （超时、断网、认证受阻）与「确实不存在」是两件事，后者只在
+/// `CheckState::Absent` 时才成立。
+///
 /// 网站版本比较统一使用**忽略 `draft` 字段**的规范化哈希，否则刚发布的文章
 /// （本地 `draft: true`、`main` `draft: false`）会被误判为「网站仍是旧版」。
 ///
-/// 「是否发布过」以**文章是否存在于 `main`**（`main_hash`）为准，而不是以
-/// `main_commit` 为准——后者是仓库级 `main` 头，任何文章都有值，用它会让
-/// 从未发布的文章被显示成「已提交发布」。
+/// 「是否发布过」以**文章是否存在于 `main`** 为准，而不是以 `main` 头为准——
+/// 后者是仓库级头，任何文章都有值，用它会让从未发布的文章显示成「已提交发布」。
 ///
 /// 「网站已上线」只认**已确认的部署结论**（`deployed_commit` 与当前 `main`
 /// 头一致）；仅推送成功而无部署确认时是「已提交发布」，绝不靠推送猜测上线。
 pub fn derive_status(inputs: &StatusInputs) -> ArticleStatus {
-    let remote_sync = match &inputs.remote.writing_hash {
-        None => RemoteSync::LocalOnly,
-        Some(hash) if hash == &inputs.local_hash => RemoteSync::Saved,
-        // 远端保存过该文章，但当前本地内容尚未同步。
-        Some(_) => RemoteSync::LocalOnly,
+    let remote_sync = match inputs.remote.writing.state {
+        // 未核对：不知道远端有没有、内容是否一致，只能如实说「未核对」。
+        CheckState::Unverified => RemoteSync::Unverified,
+        // 已核对且该分支上没有这篇文章。
+        CheckState::Absent => RemoteSync::LocalOnly,
+        CheckState::Present => match inputs.remote.writing.body_hash.as_deref() {
+            Some(hash) if hash == inputs.local_hash => RemoteSync::Saved,
+            // 远端存过该文章，但当前本地内容尚未同步过去。
+            _ => RemoteSync::LocalOnly,
+        },
     };
 
-    let site = match &inputs.remote.main_hash {
-        // 文章从未出现在 `main` 上。
-        None => SiteState::NeverPublished,
-        Some(_) => {
-            let head = inputs.remote.main_commit.as_deref();
+    let site = match inputs.remote.main.state {
+        CheckState::Unverified => SiteState::Unverified,
+        // 已核对且 `main` 上没有这篇文章。
+        CheckState::Absent => SiteState::NeverPublished,
+        CheckState::Present => {
+            let head = inputs.remote.main.head.as_deref();
             let concluded = |recorded: Option<&str>| matches!((recorded, head), (Some(a), Some(b)) if a == b);
-            if inputs.remote.main_published == Some(false) {
+            if inputs.remote.main.published == Some(false) {
                 SiteState::Withdrawn
             } else if concluded(inputs.remote.deploy_failed_commit.as_deref()) {
                 SiteState::DeployFailed
@@ -88,7 +93,7 @@ pub fn derive_status(inputs: &StatusInputs) -> ArticleStatus {
                 SiteState::Deploying
             } else if concluded(inputs.remote.deployed_commit.as_deref()) {
                 let content_current =
-                    inputs.remote.main_site_hash.as_deref() == Some(inputs.local_site_hash.as_str());
+                    inputs.remote.main.site_hash.as_deref() == Some(inputs.local_site_hash.as_str());
                 if content_current {
                     SiteState::LiveCurrentVersion
                 } else {
@@ -101,15 +106,23 @@ pub fn derive_status(inputs: &StatusInputs) -> ArticleStatus {
         }
     };
 
+    // 两分支中最近一次的已核对时间，供状态栏展示「上次远端核对时间」。
+    let remote_checked_at_unix = [
+        inputs.remote.writing.checked_at_unix,
+        inputs.remote.main.checked_at_unix,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+
     ArticleStatus {
         locally_saved: inputs.locally_saved,
         remote_sync,
         site,
         local_body_hash: inputs.local_hash.clone(),
-        writing_body_hash: inputs.remote.writing_hash.clone(),
-        main_body_hash: inputs.remote.main_hash.clone(),
-        main_commit: inputs.remote.main_commit.clone(),
-        deployment_url: inputs.remote.deployment_url.clone(),
+        writing: inputs.remote.writing.clone(),
+        main: inputs.remote.main.clone(),
+        remote_checked_at_unix,
     }
 }
 
@@ -707,6 +720,33 @@ mod tests {
         }
     }
 
+    /// 已核对的 `writing` 结论：存在该文章，原文哈希为 `hash`。
+    fn writing_with(hash: &str) -> BranchCheck {
+        BranchCheck::present(Some("w-head".to_string()), 1, hash.to_string(), None, None, None)
+    }
+
+    /// 已核对的 `writing` 结论：该分支上没有这篇文章。
+    fn writing_absent() -> BranchCheck {
+        BranchCheck::absent(None, 1)
+    }
+
+    /// 已核对的 `main` 结论：存在该文章，站点规范化哈希为 `site_hash`。
+    fn main_with(hash: &str, site_hash: &str, published: bool, head: &str) -> BranchCheck {
+        BranchCheck::present(
+            Some(head.to_string()),
+            2,
+            hash.to_string(),
+            Some(site_hash.to_string()),
+            Some(published),
+            None,
+        )
+    }
+
+    /// 已核对的 `main` 结论：该分支上没有这篇文章。
+    fn main_absent() -> BranchCheck {
+        BranchCheck::absent(None, 2)
+    }
+
     /// 创建目录联接（Windows）或目录符号链接（其它平台）。返回是否创建成功。
     ///
     /// 复用生产代码的 `cmd_path_arg`：路径里的正斜杠会被 cmd 当成开关，
@@ -723,7 +763,7 @@ mod tests {
                 return false;
             };
             matches!(
-                std::process::Command::new("cmd")
+                crate::util::program_command("cmd")
                     .args(["/c", "mklink", "/J", &link_str, &target_str])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -990,7 +1030,7 @@ mod tests {
         let mut snapshots = BTreeMap::new();
         snapshots.insert(
             "raw-a".to_string(),
-            RemoteSnapshot { writing_hash: Some(raw_hash.clone()), ..Default::default() },
+            RemoteSnapshot { writing: writing_with(&raw_hash), ..Default::default() },
         );
         let content = f.workspace.read("raw-a", &snapshots).unwrap();
         assert_eq!(content.content_hash, raw_hash, "内容哈希应取磁盘原文");
@@ -1069,18 +1109,32 @@ mod tests {
     fn status_derivation_covers_all_site_states() {
         let local = "hash-local".to_string();
         let site = "hash-site".to_string();
-        let base = StatusInputs {
+
+        // 两个分支都**未核对**：不得给出任何肯定结论（既不能说从未发布，
+        // 也不能说尚未同步）。这是 A5 新增的未知态。
+        let unchecked = StatusInputs {
             local_hash: local.clone(),
             local_site_hash: site.clone(),
             locally_saved: true,
             remote: RemoteSnapshot::default(),
         };
+        assert_eq!(derive_status(&unchecked).site, SiteState::Unverified);
+        assert_eq!(derive_status(&unchecked).remote_sync, RemoteSync::Unverified);
+        assert!(derive_status(&unchecked).remote_checked_at_unix.is_none());
+
+        // 两个分支都已核对且都不存在该文章：这才是「从未发布 / 尚未同步」。
+        let base = StatusInputs {
+            remote: RemoteSnapshot { writing: writing_absent(), main: main_absent(), ..Default::default() },
+            ..unchecked.clone()
+        };
         assert_eq!(derive_status(&base).site, SiteState::NeverPublished);
         assert_eq!(derive_status(&base).remote_sync, RemoteSync::LocalOnly);
+        // 已核对时间要能取到，供状态栏显示「上次远端核对时间」。
+        assert!(derive_status(&base).remote_checked_at_unix.is_some());
 
         // writing 已存且与本地一致。
         let synced = StatusInputs {
-            remote: RemoteSnapshot { writing_hash: Some(local.clone()), ..Default::default() },
+            remote: RemoteSnapshot { writing: writing_with(&local), ..base.remote.clone() },
             ..base.clone()
         };
         assert_eq!(derive_status(&synced).remote_sync, RemoteSync::Saved);
@@ -1088,11 +1142,8 @@ mod tests {
         // A3：main 已发布且已部署，但写作分支有新稿 → 网站仍是旧版。
         let old_site = StatusInputs {
             remote: RemoteSnapshot {
-                writing_hash: Some(local.clone()),
-                main_hash: Some("hash-old".to_string()),
-                main_site_hash: Some("hash-old-site".to_string()),
-                main_commit: Some("c1".to_string()),
-                main_published: Some(true),
+                writing: writing_with(&local),
+                main: main_with("hash-old", "hash-old-site", true, "c1"),
                 deployed_commit: Some("c1".to_string()),
                 ..Default::default()
             },
@@ -1103,11 +1154,8 @@ mod tests {
         // 已推送 main 但尚无部署确认。
         let submitted = StatusInputs {
             remote: RemoteSnapshot {
-                writing_hash: Some(local.clone()),
-                main_hash: Some("hash-published".to_string()),
-                main_site_hash: Some(site.clone()),
-                main_commit: Some("c2".to_string()),
-                main_published: Some(true),
+                writing: writing_with(&local),
+                main: main_with("hash-published", &site, true, "c2"),
                 ..Default::default()
             },
             ..base.clone()
@@ -1127,28 +1175,28 @@ mod tests {
         // 网站内容与本地一致且已部署 → 当前版本已上线。
         let current = StatusInputs {
             remote: RemoteSnapshot {
-                writing_hash: Some(local.clone()),
-                main_hash: Some("hash-published".to_string()),
-                main_site_hash: Some(site.clone()),
-                main_commit: Some("c3".to_string()),
-                main_published: Some(true),
+                writing: writing_with(&local),
+                main: BranchCheck::present(
+                    Some("c3".to_string()),
+                    1,
+                    "hash-published".to_string(),
+                    Some(site.clone()),
+                    Some(true),
+                    Some("https://example.invalid/".to_string()),
+                ),
                 deployed_commit: Some("c3".to_string()),
-                deployment_url: Some("https://example.invalid/".to_string()),
                 ..Default::default()
             },
             ..base.clone()
         };
         let status = derive_status(&current);
         assert_eq!(status.site, SiteState::LiveCurrentVersion);
-        assert_eq!(status.deployment_url.as_deref(), Some("https://example.invalid/"));
+        assert_eq!(status.main.deployment_url.as_deref(), Some("https://example.invalid/"));
 
         // 撤下。
         let withdrawn = StatusInputs {
             remote: RemoteSnapshot {
-                main_hash: Some("hash-old".to_string()),
-                main_site_hash: Some("hash-old-site".to_string()),
-                main_commit: Some("c4".to_string()),
-                main_published: Some(false),
+                main: main_with("hash-old", "hash-old-site", false, "c4"),
                 deployed_commit: Some("c4".to_string()),
                 ..Default::default()
             },
@@ -1161,6 +1209,49 @@ mod tests {
         assert!(!derive_status(&unsaved).locally_saved);
     }
 
+    /// **未知不等于否定**：核对失败（超时/断网）时两个分支都必须停在「未核对」。
+    ///
+    /// 这是 A5 的核心语义：fetch 失败若被当成「分支不存在」，界面就会把
+    /// 一篇已上线的文章显示成「从未发布」；反过来若沿用旧结论，又会把
+    /// 未知显示成「已同步」。两种情况都是对用户撒谎。
+    #[test]
+    fn failed_remote_check_never_claims_a_conclusion() {
+        // 本地内容与「上次核对到的远端内容」一致，但本次核对失败。
+        let inputs = StatusInputs {
+            local_hash: "h".to_string(),
+            local_site_hash: "s".to_string(),
+            locally_saved: true,
+            remote: RemoteSnapshot {
+                writing: BranchCheck::unverified("写作分支状态待核对：网络不可用或核对超时"),
+                main: BranchCheck::unverified("网站分支状态待核对：网络不可用或核对超时"),
+                // 部署结论即使存在也不得参与判断。
+                deployed_commit: Some("c1".to_string()),
+                ..Default::default()
+            },
+        };
+        let status = derive_status(&inputs);
+        assert_eq!(status.remote_sync, RemoteSync::Unverified, "未知不得显示为已同步");
+        assert_eq!(status.site, SiteState::Unverified, "未知不得显示为已上线或从未发布");
+        assert!(
+            status.writing.reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "未核对必须给出可操作的原因"
+        );
+
+        // 只有一支失败时，另一支的结论仍然有效，但失败的那支保持未知。
+        let one_sided = StatusInputs {
+            remote: RemoteSnapshot {
+                writing: BranchCheck::unverified("写作分支状态待核对"),
+                main: main_with("h", "s", true, "c1"),
+                deployed_commit: Some("c1".to_string()),
+                ..Default::default()
+            },
+            ..inputs.clone()
+        };
+        let status = derive_status(&one_sided);
+        assert_eq!(status.remote_sync, RemoteSync::Unverified, "失败的一支不得由另一支推定");
+        assert_eq!(status.site, SiteState::LiveCurrentVersion, "成功的一支结论照常生效");
+    }
+
     /// P0-2 回归：仓库级 `main` 头存在，但文章**从未出现在 `main`** 时，
     /// 不得显示成「已提交发布」。旧实现以 `main_commit.is_some()` 作为
     /// 「发布过」的判据，而 `main_commit` 是仓库级头，任何文章都有值。
@@ -1171,16 +1262,16 @@ mod tests {
             local_site_hash: "s".to_string(),
             locally_saved: true,
             remote: RemoteSnapshot {
-                writing_hash: Some("h".to_string()),
-                // 文章不在 main 上：main_hash / main_commit 均为 None。
-                main_hash: None,
-                main_commit: None,
+                writing: writing_with("h"),
+                // 文章不在 main 上：已核对，结论是「确认不存在」。
+                main: main_absent(),
                 ..Default::default()
             },
         };
         let status = derive_status(&inputs);
         assert_eq!(status.site, SiteState::NeverPublished);
-        assert!(status.main_commit.is_none(), "不在 main 上的文章不应带 main 提交");
+        assert!(status.main.head.is_none(), "不在 main 上的文章不应带 main 提交");
+        assert_eq!(status.main.state, CheckState::Absent);
     }
 
     /// P0-2 回归：刚推送成功、部署尚未核实时必须是「已提交发布」，
@@ -1195,11 +1286,8 @@ mod tests {
         };
         let pushed = StatusInputs {
             remote: RemoteSnapshot {
-                writing_hash: Some("h".to_string()),
-                main_hash: Some("h".to_string()),
-                main_site_hash: Some("s".to_string()),
-                main_commit: Some("c1".to_string()),
-                main_published: Some(true),
+                writing: writing_with("h"),
+                main: main_with("h", "s", true, "c1"),
                 // 没有任何部署结论。
                 ..Default::default()
             },
@@ -1263,11 +1351,13 @@ mod tests {
             local_site_hash: site_hash_of(draft_md),
             locally_saved: true,
             remote: RemoteSnapshot {
-                writing_hash: Some(util::hash_bytes(draft_md.as_bytes())),
-                main_hash: Some(util::hash_bytes(published_md.as_bytes())),
-                main_site_hash: Some(site_hash_of(published_md)),
-                main_commit: Some("c1".to_string()),
-                main_published: Some(true),
+                writing: writing_with(&util::hash_bytes(draft_md.as_bytes())),
+                main: main_with(
+                    &util::hash_bytes(published_md.as_bytes()),
+                    &site_hash_of(published_md),
+                    true,
+                    "c1",
+                ),
                 deployed_commit: Some("c1".to_string()),
                 ..Default::default()
             },

@@ -2,10 +2,6 @@
 node_modules/
 /dist/
 
-# 随前端分发的 Vditor 运行时资源（Lute、i18n、图标、highlight 主题）。
-# 它们从 node_modules 复制而来并需要进入仓库，因此不能落在上面的 dist/ 规则里。
-!public/vditor/
-
 # Rust 构建产物（体积很大，不应进入仓库）
 target/
 

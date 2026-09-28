@@ -7,10 +7,11 @@
  */
 
 /** 远程写作分支的同步状态。 */
-export type RemoteSync = 'local-only' | 'saving' | 'saved' | 'conflict' | 'failed'
+export type RemoteSync = 'unverified' | 'local-only' | 'saving' | 'saved' | 'conflict' | 'failed'
 
 /** 主站版本与 Pages 部署状态。 */
 export type SiteState =
+  | 'unverified'
   | 'never-published'
   | 'live-old-version'
   | 'publication-submitted'
@@ -18,6 +19,33 @@ export type SiteState =
   | 'live-current-version'
   | 'deploy-failed'
   | 'withdrawn'
+
+/**
+ * 单个远端分支上一次核对的结论类别。
+ *
+ * `undefined` 无法区分「没查过」「查了但失败」「确认不存在」——三者对用户
+ * 意味着完全不同的下一步，因此必须分开表达；未知一律不得等同于肯定结论。
+ */
+export type CheckState = 'unverified' | 'absent' | 'present'
+
+/** 单个远端分支上该文章的核对结论。 */
+export type BranchCheck = {
+  state: CheckState
+  /** 未核对时的原因（面向用户）。 */
+  reason?: string
+  /** 核对时所依据的远端头（分支不存在则为空）。 */
+  head?: string
+  /** 核对时间（Unix 秒）。 */
+  checkedAtUnix?: number
+  /** 该文件的原始内容哈希（`present` 时才有值，含 `draft` 字段）。 */
+  bodyHash?: string
+  /** 该文件按站点发布版规范化后的哈希（`present` 时才有值）。 */
+  siteHash?: string
+  /** 该分支上是否公开（`draft: false`）。 */
+  published?: boolean
+  /** 该分支上该文章记录的上线地址。 */
+  deploymentUrl?: string
+}
 
 /** 业务错误码。前端据此给出操作性提示。 */
 export type ErrorCode =
@@ -38,6 +66,7 @@ export type ErrorCode =
   | 'offline'
   | 'toolchain-missing'
   | 'preview-failed'
+  | 'preview-dependencies-missing'
   | 'build-failed'
   | 'io-failed'
   | 'invalid-argument'
@@ -56,10 +85,19 @@ export type ArticleStatus = {
   site: SiteState
   /** 本地文件完整内容哈希。 */
   localBodyHash: string
-  writingBodyHash?: string
-  mainBodyHash?: string
-  mainCommit?: string
-  deploymentUrl?: string
+  /** `writing` 分支的核对结论（含未核对态）。 */
+  writing: BranchCheck
+  /** `main` 分支的核对结论（含未核对态）。 */
+  main: BranchCheck
+  /** 远端两分支中最近一次核对时间（Unix 秒）。未核对时为空。 */
+  remoteCheckedAtUnix?: number
+}
+
+/** 一次远端核对的结果；`localBodyHash` 用于丢弃过期结果。 */
+export type RemoteCheckOutcome = {
+  articleId: string
+  localBodyHash: string
+  status: ArticleStatus
 }
 
 /** 文章站点元数据（对应 `src/content.config.ts` 的 schema）。 */
@@ -232,6 +270,17 @@ export type ToolchainReport = {
   guidance: string[]
 }
 
+/**
+ * 环境检查状态。
+ *
+ * 启动路径**不**执行探测命令，只读上次结果；因此界面必须先显示「尚未检查」，
+ * 由用户显式触发后才变成有结论的状态。「找到候选文件」不等于「程序可执行」。
+ */
+export type ToolchainState =
+  | { kind: 'unchecked' }
+  | { kind: 'checkFailed'; reason: string }
+  | { kind: 'checked'; atUnix: number; report: ToolchainReport }
+
 /** 首次连接状态。 */
 export type ConnectionStatus = {
   repoLabel: string
@@ -239,7 +288,7 @@ export type ConnectionStatus = {
   workspaceDir: string
   connected: boolean
   workspaceReady: boolean
-  toolchain: ToolchainReport
+  toolchain: ToolchainState
   publicDisclosure: string
   disclosedPublicDrafts: boolean
   blockingIssue?: string
@@ -253,7 +302,12 @@ export type WritingPreferences = {
   previewWidth: number
   editorMode: EditorMode
   autoSaveDebounceMs: number
+  /** 外壳配色。`system` 跟随操作系统，是默认值。 */
+  shellTheme: ShellTheme
 }
+
+/** 外壳配色：跟随系统 / 浅色 / 深色。只作用于软件外壳，站点预览始终浅色。 */
+export type ShellTheme = 'system' | 'light' | 'dark'
 
 /** 编辑器模式：`sv` 源码分屏 / `ir` 正文即时渲染。 */
 export type EditorMode = 'sv' | 'ir'
@@ -276,6 +330,19 @@ export type PreviewSessionInfo = {
   offlineFontNotice?: string
   simulatePublic: boolean
 }
+
+/**
+ * 网站预览依赖的准备状态。
+ *
+ * `preparing` 只会在**真的启动了后台任务**时出现：启动预览本身不会安装依赖，
+ * 缺依赖时返回 `preview-dependencies-missing` 错误；准备任务由用户显式触发，
+ * 带真实任务标识，可去重与查询。
+ */
+export type PreviewDependencyStatus =
+  | { kind: 'missing' }
+  | { kind: 'preparing'; taskId: string; startedAtUnix: number }
+  | { kind: 'ready'; taskId?: string; checkedAtUnix: number }
+  | { kind: 'failed'; taskId: string; reason: string; detail?: string; failedAtUnix: number }
 
 /** 部署状态查询结果。 */
 export type DeploymentStatus = {
@@ -317,6 +384,7 @@ export type ArticleFilter =
   | 'remote-saved'
   | 'site-published'
   | 'conflict'
+  | 'unverified'
   | 'trash'
 
 /** 文章列表排序。 */
@@ -332,6 +400,8 @@ export function describeStatus(status: ArticleStatus): {
   const local = status.locallySaved ? '本地已保存' : '尚未保存到磁盘'
 
   const remoteMap: Record<RemoteSync, string> = {
+    // 「待核对」必须与「尚未同步」分开：前者是不知道，后者是核对了确实没有。
+    unverified: '远端待核对',
     'local-only': '尚未同步',
     saving: '正在同步',
     saved: '远程已存',
@@ -340,6 +410,7 @@ export function describeStatus(status: ArticleStatus): {
   }
 
   const siteMap: Record<SiteState, string> = {
+    unverified: '网站状态待核对',
     'never-published': '从未发布',
     'live-old-version': '网站仍是旧版',
     'publication-submitted': '已提交发布',
@@ -363,6 +434,19 @@ export function describeStatus(status: ArticleStatus): {
     site: siteMap[status.site],
     tone: toneBySite[status.site] ?? 'neutral',
   }
+}
+
+/**
+ * 状态栏的「上次远端核对时间」文案。
+ *
+ * 未核对时必须是明确的未知，不能因为「没有时间」就省略这一项——省略会让
+ * 用户以为状态是新鲜的。
+ */
+export function describeRemoteCheckedAt(checkedAtUnix?: number): string {
+  if (!checkedAtUnix) return '尚未核对远端'
+  const at = new Date(checkedAtUnix * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `上次远端核对：${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`
 }
 
 /** 危险操作的中文标签（按钮必须有文字，不只靠颜色）。 */
